@@ -126,7 +126,7 @@ git commit -m "feat: review frozen diffs by verified hash"
 - Consumes: a caller-supplied absolute or cwd-relative diff artifact path plus 64-hex SHA-256
 - Produces: one foreground invocation of the frozen runtime mode and a truthful `REVIEWED` or `NOT REVIEWED` report
 
-- [ ] **Step 1: Extend the package test and confirm RED**
+- [x] **Step 1: Extend the package test and confirm RED**
 
 Assert `kimi-review/SKILL.md` exists, has only `name` and `description` frontmatter, invokes:
 
@@ -138,7 +138,7 @@ Assert the skill requires both inputs, forbids live-Git fallback/background beha
 
 Run `node plugins/kimi/tests/codex-plugin-surface.test.mjs`; expect FAIL because `kimi-review` is absent.
 
-- [ ] **Step 2: Initialize and write the minimal skill**
+- [x] **Step 2: Initialize and write the minimal skill**
 
 Run the skill-creator initializer for `kimi-review` under `plugins/kimi/skills`. Write imperative instructions that resolve `PLUGIN_ROOT`, require `DIFF_FILE` and `DIFF_SHA256`, invoke the runtime exactly once, validate the returned status/hash/byte count, relay findings, and report any nonzero, malformed, or missing provenance as `NOT REVIEWED` without retrying another scope.
 
@@ -153,7 +153,7 @@ interface:
 
 Update plugin copy to advertise setup plus frozen adversarial review, while still excluding hooks, MCP, apps, task, and job-control equivalence.
 
-- [ ] **Step 3: Verify the skill and package surface**
+- [x] **Step 3: Verify the skill and package surface**
 
 Run:
 
@@ -163,7 +163,7 @@ python3 /Users/imperix/.codex/skills/.system/skill-creator/scripts/quick_validat
 
 Expected: `Skill is valid!`, `CODEX-PLUGIN-SURFACE-GREEN`, `GATE-GREEN`.
 
-- [ ] **Step 4: Commit the native skill unit**
+- [x] **Step 4: Commit the native skill unit**
 
 ```bash
 git add plugins/kimi/.codex-plugin/plugin.json plugins/kimi/skills/kimi-review plugins/kimi/tests/codex-plugin-surface.test.mjs
