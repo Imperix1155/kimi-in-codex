@@ -11,7 +11,7 @@ Native Codex surface:
 - `.agents/plugins/marketplace.json` exposes `plugins/kimi`.
 - `plugins/kimi/.codex-plugin/plugin.json` advertises bundled skills only.
 - `plugins/kimi/skills/kimi-setup` invokes the retained setup probe through the plugin root.
-- `plugins/kimi/skills/kimi-review` invokes foreground review only with a caller-supplied UTF-8 diff artifact and its verified SHA-256. The runtime uses an empty temporary ACP session cwd and returns ledger-ready hash/byte provenance.
+- `plugins/kimi/skills/kimi-review` invokes foreground review only with a caller-supplied UTF-8 diff artifact and its verified SHA-256. It requests one narrowly elevated Codex runtime call for the existing authenticated Kimi home/log state and model connection, with no sandbox-first or fallback invocation. The runtime uses an empty temporary ACP session cwd, keeps ACP permissions reject-only, returns ledger-ready hash/byte provenance, and exposes bounded broker startup evidence on `NOT REVIEWED`.
 
 Deferred until independently implemented and verified: task; automatic freezing and coverage-ledger orchestration; mutable working-tree/branch and background review flows; status, result, cancel, rescue, hooks, Codex data naming, and the MCP wrapper. Claude command/agent/hook files remain migration source material and are not advertised by the Codex manifest.
 

@@ -65,6 +65,7 @@
 - [ ] **KMP-33** Decide and verify the Codex replacement for rescue-agent routing.
 - [ ] **KMP-34** Port lifecycle hooks and Codex `PLUGIN_DATA` state only after runtime tests cover the semantic differences.
 - [ ] **KMP-35** Port automatic diff freezing, SHA-pinned coverage-ledger orchestration, and mutable working-tree/branch review only with separate drift tests.
+- [ ] **KMP-36** Make native frozen review durable in Codex's sandboxed task runtime: one narrowly elevated runtime invocation, no credential redirection or fallback, bounded broker-startup evidence in `NOT REVIEWED`, and a fresh-task installed-plugin canary.
 
 ---
 

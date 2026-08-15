@@ -788,6 +788,26 @@ function makeGitWorkspace(scenario) {
   shutdownBroker(env, cwd);
 }
 
+// 13g. A verified artifact whose ACP child cannot start preserves bounded
+// broker evidence in the structured NOT REVIEWED envelope. This is the
+// native Codex sandbox failure shape, not an authentication failure.
+{
+  const { cwd, env } = makeGitWorkspace("startup-home-log-denied");
+  const artifact = writeFrozenDiff("diff --git a/a b/a\n+broker startup evidence\n");
+  const review = runCli([
+    "review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--json"
+  ], { env, cwd });
+  assert.notEqual(review.status, 0);
+  const payload = JSON.parse(review.stdout);
+  assert.equal(payload.reviewStatus, "NOT REVIEWED");
+  assert.equal(payload.target.diffSha256, artifact.sha256);
+  assert.equal(payload.target.byteCount, artifact.bytes.length);
+  assert.equal(payload.brokerStartup?.reason, "child-exit");
+  assert.equal(payload.brokerStartup?.exitCode, 1);
+  assert.equal(payload.brokerStartup?.signal, null);
+  assert.match(payload.brokerStartup?.logTail ?? "", /PermissionError.*kimi\.log/s);
+}
+
 // 14. Setup probes: all three states of the M4 gate criterion.
 // ready — the fake agent accepts session/new.
 {

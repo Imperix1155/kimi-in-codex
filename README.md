@@ -33,6 +33,8 @@ The probe checks Node.js, the Kimi executable, ACP runtime availability, and liv
 
 Invoke `$kimi-review` with a saved UTF-8 diff artifact and its SHA-256. The runtime reads the artifact once, verifies the digest before Kimi starts, inlines exactly those bytes, and creates the read-only ACP session in an empty temporary workspace so it cannot silently review a newer checkout. Successful JSON includes `reviewStatus: "REVIEWED"`, the verified `diffSha256`, byte count, verdict, and structured findings.
 
+Each review requests one narrowly scoped elevated Codex shell execution so the existing authenticated Kimi runtime can read its `~/.kimi` state and logs and reach its model service. It does not grant Kimi write permission to the artifact or workspace: ACP permission requests remain reject-only, there is no sandbox-first retry, and denial or startup failure returns structured `NOT REVIEWED` with bounded broker exit/log/context evidence where available.
+
 Any missing artifact, malformed or mismatched digest, unavailable Kimi/auth, permission-policy regression, or invalid structured response exits nonzero as `NOT REVIEWED`. The skill never falls back to a live Git diff.
 
 ## Not yet ported
