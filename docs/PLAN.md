@@ -2,7 +2,7 @@
 
 This target repository ports the proven Kimi/ACP engine from the separate Claude Code repository into a native Codex plugin. The original repository remains the working Claude fallback and is not edited by this port.
 
-Status: **Codex setup slice implemented; broader Codex behaviors deferred.** The historical M1–M4 sections below document the already-proven engine, not Codex wrapper equivalence.
+Status: **Codex setup and frozen-review slices implemented; broader Codex behaviors deferred.** The historical M1–M4 sections below document the already-proven engine, not Codex wrapper equivalence.
 
 ## 0. Codex port boundary (2026-08-15)
 
@@ -11,8 +11,9 @@ Native Codex surface:
 - `.agents/plugins/marketplace.json` exposes `plugins/kimi`.
 - `plugins/kimi/.codex-plugin/plugin.json` advertises bundled skills only.
 - `plugins/kimi/skills/kimi-setup` invokes the retained setup probe through the plugin root.
+- `plugins/kimi/skills/kimi-review` invokes foreground review only with a caller-supplied UTF-8 diff artifact and its verified SHA-256. The runtime uses an empty temporary ACP session cwd and returns ledger-ready hash/byte provenance.
 
-Deferred until independently implemented and verified: task, review, status, result, cancel, rescue, hooks, Codex data naming, and the MCP wrapper. Claude command/agent/hook files remain migration source material and are not advertised by the Codex manifest.
+Deferred until independently implemented and verified: task; automatic freezing and coverage-ledger orchestration; mutable working-tree/branch and background review flows; status, result, cancel, rescue, hooks, Codex data naming, and the MCP wrapper. Claude command/agent/hook files remain migration source material and are not advertised by the Codex manifest.
 
 ---
 
@@ -60,7 +61,7 @@ kimi-in-codex/                     (independent history copy; NOTICE preserved)
     ├── schemas/review-output.schema.json
     ├── commands/    review.md  task.md  status.md  result.md  cancel.md  setup.md  rescue.md
     ├── agents/      kimi-rescue.md
-    ├── skills/      kimi-setup/  kimi-cli-runtime/  kimi-result-handling/
+    ├── skills/      kimi-setup/  kimi-review/  kimi-cli-runtime/  kimi-result-handling/
     ├── prompts/     review.md  stop-review-gate.md
     ├── tests/       *.test.mjs + fixtures/fake-acp-agent.mjs   (plain-node suites)
     └── scripts/

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kimi Review"
+  short_description: "Review a frozen diff with Kimi"
+  default_prompt: "Use $kimi-review to review this frozen diff artifact and verify its SHA-256."

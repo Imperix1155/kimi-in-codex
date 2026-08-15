@@ -1,7 +1,7 @@
 {
   "name": "kimi",
   "version": "0.1.5",
-  "description": "Check and prepare the Kimi Code CLI for Codex workflows.",
+  "description": "Check Kimi readiness and review verified frozen diffs from Codex.",
   "author": {
     "name": "Imperix1155",
     "url": "https://github.com/Imperix1155"
@@ -9,16 +9,16 @@
   "homepage": "https://github.com/Imperix1155/kimi-in-codex#readme",
   "repository": "https://github.com/Imperix1155/kimi-in-codex",
   "license": "Apache-2.0",
-  "keywords": ["kimi", "codex", "setup"],
+  "keywords": ["kimi", "codex", "setup", "review"],
   "skills": "./skills/",
   "interface": {
     "displayName": "Kimi",
-    "shortDescription": "Prepare Kimi Code CLI for Codex.",
-    "longDescription": "Verify that the local Kimi Code CLI is installed, authenticated, and ready. Delegation and review workflows are not included in this initial Codex slice.",
+    "shortDescription": "Prepare Kimi and review frozen diffs.",
+    "longDescription": "Verify local Kimi readiness and run foreground adversarial reviews against a frozen saved diff whose SHA-256 is verified before Kimi starts. Task delegation, background job control, rescue, and hooks are not yet included.",
     "developerName": "Imperix1155",
     "category": "Productivity",
     "capabilities": ["Read"],
     "websiteURL": "https://github.com/Imperix1155/kimi-in-codex",
-    "defaultPrompt": ["Use Kimi Setup to check whether my Kimi Code CLI is ready."]
+    "defaultPrompt": ["Use Kimi Setup to check readiness or Kimi Review to review a verified frozen diff."]
   }
 }
