@@ -464,7 +464,10 @@ await withBroker("basic", async (session, cwd) => {
 
 // 12e. A child spawn failure is distinct from child exit and never exposes
 // the arbitrary, potentially sensitive Error.message.
-{
+for (const spawnCase of [
+  { code: "EACCES", expectedCode: "EACCES" },
+  { code: `SECRET_${"X".repeat(BROKER_LOG_TAIL_BYTES * 2)}`, expectedCode: null }
+]) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
   let failedSessionDir = null;
   let failure = null;
@@ -481,7 +484,7 @@ await withBroker("basic", async (session, cwd) => {
         child.signalCode = null;
         process.nextTick(() => {
           const error = new Error(`secret-spawn-marker-${"x".repeat(BROKER_LOG_TAIL_BYTES * 2)}`);
-          error.code = "EACCES";
+          error.code = spawnCase.code;
           child.emit("error", error);
         });
         return child;
@@ -492,10 +495,15 @@ await withBroker("basic", async (session, cwd) => {
   }
   assert.ok(failure instanceof BrokerStartupError);
   assert.equal(failure.data?.brokerStartup?.reason, "spawn-error");
-  assert.equal(failure.data?.brokerStartup?.spawnErrorCode, "EACCES");
+  assert.equal(failure.data?.brokerStartup?.spawnErrorCode ?? null, spawnCase.expectedCode);
   assert.equal(Object.hasOwn(failure.data?.brokerStartup ?? {}, "spawnError"), false);
   assert.doesNotMatch(JSON.stringify(failure), /secret-spawn-marker/);
-  assert.match(failure.message, /child spawn failed \(EACCES\)/);
+  if (spawnCase.expectedCode) {
+    assert.match(failure.message, /child spawn failed \(EACCES\)/);
+  } else {
+    assert.equal(failure.message.includes(spawnCase.code), false);
+    assert.equal(failure.message, "Failed to start the shared agent broker (child spawn failed).");
+  }
   assert.ok(failedSessionDir);
   assert.equal(fs.existsSync(failedSessionDir), false);
 }

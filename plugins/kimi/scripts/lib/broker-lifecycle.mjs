@@ -13,6 +13,10 @@ export const PID_FILE_ENV = "KIMI_COMPANION_BROKER_PID_FILE";
 export const LOG_FILE_ENV = "KIMI_COMPANION_BROKER_LOG_FILE";
 export const BROKER_LOG_TAIL_BYTES = 8 * 1024;
 const BROKER_STATE_FILE = "broker.json";
+const BROKER_SPAWN_ERROR_CODES = new Set([
+  "E2BIG", "EACCES", "EAGAIN", "EINVAL", "EMFILE", "ENFILE",
+  "ENOENT", "ENOEXEC", "ENOMEM", "EPERM"
+]);
 
 export class BrokerStartupError extends Error {
   constructor(message, brokerStartup) {
@@ -87,7 +91,7 @@ function waitForChildClose(child) {
   return new Promise((resolve) => {
     child.once("close", (exitCode, signal) => resolve({ reason: "child-exit", exitCode, signal }));
     child.once("error", (error) => {
-      const spawnErrorCode = typeof error?.code === "string" && /^[A-Z0-9_]+$/.test(error.code)
+      const spawnErrorCode = typeof error?.code === "string" && BROKER_SPAWN_ERROR_CODES.has(error.code)
         ? error.code
         : null;
       resolve({ reason: "spawn-error", exitCode: null, signal: null, spawnErrorCode });
