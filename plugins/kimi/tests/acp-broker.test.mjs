@@ -390,11 +390,16 @@ await withBroker("basic", async (session, cwd) => {
 // without allowing an unbounded child log into structured error output.
 {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
+  const brokerScript = path.join(cwd, "oversized-broker.mjs");
+  fs.writeFileSync(
+    brokerScript,
+    `process.stderr.write(\`${"é".repeat(BROKER_LOG_TAIL_BYTES)}:BROKER-LOG-END\\n\`); process.exit(1);\n`,
+    "utf8"
+  );
   let failure = null;
   try {
-    await AcpClient.connect(cwd, {
-      useBroker: true,
-      brokerOptions: { extraBrokerArgs: agentSpawnArgs("startup-long-stderr") }
+    await ensureBrokerSession(cwd, {
+      scriptPath: brokerScript
     });
   } catch (error) {
     failure = error;
@@ -404,8 +409,56 @@ await withBroker("basic", async (session, cwd) => {
   assert.equal(evidence?.reason, "child-exit");
   assert.equal(evidence?.logTruncated, true);
   assert.ok(Buffer.byteLength(evidence?.logTail ?? "", "utf8") <= BROKER_LOG_TAIL_BYTES);
-  assert.doesNotMatch(evidence?.logTail ?? "", /BROKER-LOG-BEGIN/);
   assert.match(evidence?.logTail ?? "", /BROKER-LOG-END/);
+}
+
+// 12c. Arbitrary agent stderr is not exposed through broker diagnostics.
+{
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
+  let failure = null;
+  try {
+    await AcpClient.connect(cwd, {
+      useBroker: true,
+      brokerOptions: { extraBrokerArgs: agentSpawnArgs("startup-sensitive-stderr") }
+    });
+  } catch (error) {
+    failure = error;
+  }
+  const logTail = failure?.data?.brokerStartup?.logTail ?? "";
+  assert.match(logTail, /Agent startup diagnostic: PermissionError opening ~\/\.kimi\/logs\/kimi\.log/);
+  assert.doesNotMatch(logTail, /secret-marker-123|PROMPT_MARKER|ARTIFACT_MARKER|Users\/example/);
+}
+
+// 12d. Evidence capture is best-effort: a log I/O failure remains structured
+// and cannot bypass teardown of the failed detached broker.
+{
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
+  let failedSessionDir = null;
+  let failure = null;
+  try {
+    await ensureBrokerSession(cwd, {
+      extraBrokerArgs: agentSpawnArgs("startup-home-log-denied"),
+      createBrokerEndpoint(sessionDir, platform) {
+        failedSessionDir = sessionDir;
+        return createBrokerEndpoint(sessionDir, platform);
+      },
+      readBrokerLogTail() {
+        const error = new Error("sensitive path must not escape");
+        error.code = "EACCES";
+        throw error;
+      }
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof BrokerStartupError);
+  assert.equal(failure.data?.brokerStartup?.logTail, "");
+  assert.equal(failure.data?.brokerStartup?.logTruncated, false);
+  assert.equal(failure.data?.brokerStartup?.logReadError, "broker log read failed (EACCES)");
+  assert.doesNotMatch(JSON.stringify(failure.data), /sensitive path/);
+  assert.ok(failedSessionDir);
+  assert.equal(fs.existsSync(failedSessionDir), false, "log-read failure must not bypass broker teardown");
+  assert.equal(loadBrokerSession(cwd), null);
 }
 
 // 13. Concurrent ensureBrokerSession: exactly one broker survives in state

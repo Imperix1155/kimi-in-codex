@@ -792,7 +792,7 @@ function makeGitWorkspace(scenario) {
 // broker evidence in the structured NOT REVIEWED envelope. This is the
 // native Codex sandbox failure shape, not an authentication failure.
 {
-  const { cwd, env } = makeGitWorkspace("startup-home-log-denied");
+  const { cwd, env } = makeGitWorkspace("startup-sensitive-stderr");
   const artifact = writeFrozenDiff("diff --git a/a b/a\n+broker startup evidence\n");
   const review = runCli([
     "review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--json"
@@ -805,7 +805,8 @@ function makeGitWorkspace(scenario) {
   assert.equal(payload.brokerStartup?.reason, "child-exit");
   assert.equal(payload.brokerStartup?.exitCode, 1);
   assert.equal(payload.brokerStartup?.signal, null);
-  assert.match(payload.brokerStartup?.logTail ?? "", /PermissionError.*kimi\.log/s);
+  assert.match(payload.brokerStartup?.logTail ?? "", /Agent startup diagnostic: PermissionError opening ~\/\.kimi\/logs\/kimi\.log/);
+  assert.doesNotMatch(JSON.stringify(payload), /secret-marker-123|PROMPT_MARKER|ARTIFACT_MARKER|Users\/example/);
 }
 
 // 14. Setup probes: all three states of the M4 gate criterion.

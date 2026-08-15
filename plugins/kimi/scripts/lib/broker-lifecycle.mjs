@@ -103,8 +103,12 @@ function readBrokerLogTail(logFile, maxBytes = BROKER_LOG_TAIL_BYTES) {
   } finally {
     fs.closeSync(descriptor);
   }
+  let logTail = buffer.toString("utf8");
+  while (Buffer.byteLength(logTail, "utf8") > maxBytes) {
+    logTail = Array.from(logTail).slice(1).join("");
+  }
   return {
-    logTail: buffer.toString("utf8"),
+    logTail,
     logTruncated: size > maxBytes
   };
 }
@@ -291,27 +295,39 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
   if (outcome.reason !== "ready") {
     const exitCode = outcome.exitCode ?? child.exitCode ?? null;
     const signal = outcome.signal ?? child.signalCode ?? null;
-    const log = readBrokerLogTail(logFile);
-    const brokerStartup = {
-      reason: outcome.reason,
-      exitCode,
-      signal,
-      ...log,
-      scriptPath,
-      cwd,
-      endpointKind: parseBrokerEndpoint(endpoint).kind,
-      ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {})
-    };
-    // A broker that never came up (e.g. its agent hung during initialize)
-    // must not linger detached and untracked.
-    teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: child.pid ?? null,
-      killProcess: killImpl
-    });
+    let log = { logTail: "", logTruncated: false };
+    try {
+      log = (options.readBrokerLogTail ?? readBrokerLogTail)(logFile);
+    } catch (error) {
+      const code = typeof error?.code === "string" && /^[A-Z0-9_]+$/.test(error.code)
+        ? ` (${error.code})`
+        : "";
+      log = { logTail: "", logTruncated: false, logReadError: `broker log read failed${code}` };
+    }
+    let brokerStartup;
+    try {
+      brokerStartup = {
+        reason: outcome.reason,
+        exitCode,
+        signal,
+        ...log,
+        scriptPath,
+        cwd,
+        endpointKind: parseBrokerEndpoint(endpoint).kind,
+        ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {})
+      };
+    } finally {
+      // A broker that never came up (e.g. its agent hung during initialize)
+      // must not linger detached and untracked, even if evidence capture fails.
+      teardownBrokerSession({
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid: child.pid ?? null,
+        killProcess: killImpl
+      });
+    }
     const outcomeLabel = outcome.reason === "child-exit"
       ? signal ? `child exited with signal ${signal}` : `child exited with code ${exitCode ?? "unknown"}`
       : "readiness timed out";

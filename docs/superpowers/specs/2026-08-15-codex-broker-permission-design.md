@@ -14,6 +14,8 @@ The broker currently waits for its endpoint, tears down the failed child and tem
 
 Retain the existing shared broker and authenticated Kimi home state. Native `$kimi-review` requests one narrowly justified elevated execution from the outset. The elevated execution is required because Kimi uses its local authenticated state and logs under `~/.kimi` and connects to its model service; neither is available inside the default workspace sandbox.
 
+The elevated process has the user's normal filesystem authority; it is not confined by Codex's OS sandbox. The review's implemented read-only boundary is therefore limited to the empty isolated ACP session cwd and the verified reject-only response to every ACP permission request. User-facing documentation must state that distinction rather than claiming elevation cannot write files.
+
 Do not redirect or copy `KIMI_SHARE_DIR`, Kimi configuration, or OAuth credentials. Do not bypass the broker. Do not retry after a failed review invocation, fall back to Git state, or weaken the ACP permission-rejection policy.
 
 ## Broker startup evidence

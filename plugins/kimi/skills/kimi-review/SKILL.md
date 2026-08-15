@@ -19,6 +19,8 @@ Review one frozen diff artifact without substituting mutable repository state.
 
    Do not first attempt the command inside the sandbox. Kimi requires its local authenticated state and outbound model connection; the elevated call below is the single review invocation.
 
+   If the elevated execution is denied, no runtime JSON exists: report `NOT REVIEWED: required Kimi runtime permission was denied.` Do not retry.
+
    ```bash
    node "${PLUGIN_ROOT}/scripts/kimi-companion.mjs" review --diff-file "${DIFF_FILE}" --diff-sha256 "${DIFF_SHA256}" --json
    ```
