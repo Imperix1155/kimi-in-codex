@@ -293,7 +293,18 @@ async function main() {
   server.listen(listenTarget.path);
 }
 
+function summarizeAgentStartupStderr(stderr) {
+  if (typeof stderr !== "string" || stderr.length === 0) {
+    return "";
+  }
+  if (/PermissionError[\s\S]*[\\/]\.kimi[\\/]logs[\\/]kimi\.log/i.test(stderr)) {
+    return "Agent startup diagnostic: PermissionError opening ~/.kimi/logs/kimi.log";
+  }
+  return `Agent startup diagnostic: stderr omitted for safety (${Buffer.byteLength(stderr, "utf8")} bytes)`;
+}
+
 main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  const agentDiagnostic = summarizeAgentStartupStderr(error?.data?.stderr);
+  process.stderr.write(`Shared agent broker startup failed.${agentDiagnostic ? `\n${agentDiagnostic}` : ""}\n`);
   process.exit(1);
 });

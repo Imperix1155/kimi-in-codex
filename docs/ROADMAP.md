@@ -65,6 +65,7 @@
 - [ ] **KMP-33** Decide and verify the Codex replacement for rescue-agent routing.
 - [ ] **KMP-34** Port lifecycle hooks and Codex `PLUGIN_DATA` state only after runtime tests cover the semantic differences.
 - [ ] **KMP-35** Port automatic diff freezing, SHA-pinned coverage-ledger orchestration, and mutable working-tree/branch review only with separate drift tests.
+- [x] **KMP-36** ✅ 2026-08-15 — native frozen review now survives Codex's sandbox boundary without relocating authentication or bypassing the broker: the skill requests one narrowly elevated runtime invocation with no sandbox-first retry/fallback; broker child exit/signal or sanitized spawn-error code plus an 8 KiB UTF-8-safe sanitized log tail and launch context are captured before guaranteed cleanup and propagated through structured `NOT REVIEWED`. The consent prompt and docs state that the elevated process has normal user filesystem authority and that read-only enforcement is the isolated ACP session plus reject-only permission handling, not an OS sandbox. TDD pinned the observed `~/.kimi/logs/kimi.log` permission failure, secret omission, spawn/log-read failures, timeout/exit distinction, truncation, cleanup, provenance, and package instructions. Verified with all eight deterministic suites, plugin/skill validators, gitleaks, live ACP `PONG`, and an installed fresh Codex-task canary: one `$kimi-review` invocation returned `REVIEWED`, exact SHA/335-byte provenance, zero permission events, and the seeded divide-by-zero finding.
 
 ---
 

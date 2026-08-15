@@ -64,6 +64,12 @@ assert.equal(
   "review skill must invoke the runtime exactly once"
 );
 assert.match(reviewSkill, /Do not retry against `git diff`/);
+assert.match(reviewSkill, /sandbox_permissions:\s*["`]require_escalated["`]/);
+assert.match(reviewSkill, /authenticated local Kimi runtime/i);
+assert.match(reviewSkill, /Do not first attempt.*sandbox/i);
+assert.match(reviewSkill, /denied.*NOT REVIEWED/i);
+assert.match(reviewSkill, /normal user filesystem authority/i);
+assert.match(reviewSkill, /not (?:an )?OS sandbox/i);
 assert.doesNotMatch(reviewSkill, /\$ARGUMENTS|AskUserQuestion|CLAUDE_PLUGIN_ROOT/);
 
 const reviewMetadata = fs.readFileSync(path.join(pluginRoot, "skills", "kimi-review", "agents", "openai.yaml"), "utf8");

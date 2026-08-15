@@ -11,7 +11,20 @@ import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "KIMI_COMPANION_BROKER_PID_FILE";
 export const LOG_FILE_ENV = "KIMI_COMPANION_BROKER_LOG_FILE";
+export const BROKER_LOG_TAIL_BYTES = 8 * 1024;
 const BROKER_STATE_FILE = "broker.json";
+const BROKER_SPAWN_ERROR_CODES = new Set([
+  "E2BIG", "EACCES", "EAGAIN", "EINVAL", "EMFILE", "ENFILE",
+  "ENOENT", "ENOEXEC", "ENOMEM", "EPERM"
+]);
+
+export class BrokerStartupError extends Error {
+  constructor(message, brokerStartup) {
+    super(message);
+    this.name = "BrokerStartupError";
+    this.data = { brokerStartup };
+  }
+}
 
 export function createBrokerSessionDir(prefix = "kmc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -72,6 +85,41 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
   child.unref();
   fs.closeSync(logFd);
   return child;
+}
+
+function waitForChildClose(child) {
+  return new Promise((resolve) => {
+    child.once("close", (exitCode, signal) => resolve({ reason: "child-exit", exitCode, signal }));
+    child.once("error", (error) => {
+      const spawnErrorCode = typeof error?.code === "string" && BROKER_SPAWN_ERROR_CODES.has(error.code)
+        ? error.code
+        : null;
+      resolve({ reason: "spawn-error", exitCode: null, signal: null, spawnErrorCode });
+    });
+  });
+}
+
+function readBrokerLogTail(logFile, maxBytes = BROKER_LOG_TAIL_BYTES) {
+  if (!fs.existsSync(logFile)) {
+    return { logTail: "", logTruncated: false };
+  }
+  const size = fs.statSync(logFile).size;
+  const length = Math.min(size, maxBytes);
+  const buffer = Buffer.alloc(length);
+  const descriptor = fs.openSync(logFile, "r");
+  try {
+    fs.readSync(descriptor, buffer, 0, length, size - length);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  let logTail = buffer.toString("utf8");
+  while (Buffer.byteLength(logTail, "utf8") > maxBytes) {
+    logTail = Array.from(logTail).slice(1).join("");
+  }
+  return {
+    logTail,
+    logTruncated: size > maxBytes
+  };
 }
 
 function resolveBrokerStateFile(cwd) {
@@ -239,7 +287,7 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
     options.scriptPath ??
     fileURLToPath(new URL("../acp-broker.mjs", import.meta.url));
 
-  const child = spawnBrokerProcess({
+  const child = (options.spawnBrokerProcess ?? spawnBrokerProcess)({
     scriptPath,
     cwd,
     endpoint,
@@ -249,19 +297,52 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
-    // A broker that never came up (e.g. its agent hung during initialize)
-    // must not linger detached and untracked.
-    teardownBrokerSession({
-      endpoint,
-      pidFile,
-      logFile,
-      sessionDir,
-      pid: child.pid ?? null,
-      killProcess: killImpl
-    });
-    return null;
+  const outcome = await Promise.race([
+    waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000).then((ready) => ({ reason: ready ? "ready" : "timeout" })),
+    waitForChildClose(child)
+  ]);
+  if (outcome.reason !== "ready") {
+    const exitCode = outcome.exitCode ?? child.exitCode ?? null;
+    const signal = outcome.signal ?? child.signalCode ?? null;
+    let log = { logTail: "", logTruncated: false };
+    try {
+      log = (options.readBrokerLogTail ?? readBrokerLogTail)(logFile);
+    } catch (error) {
+      const code = typeof error?.code === "string" && /^[A-Z0-9_]+$/.test(error.code)
+        ? ` (${error.code})`
+        : "";
+      log = { logTail: "", logTruncated: false, logReadError: `broker log read failed${code}` };
+    }
+    let brokerStartup;
+    try {
+      brokerStartup = {
+        reason: outcome.reason,
+        exitCode,
+        signal,
+        ...log,
+        scriptPath,
+        cwd,
+        endpointKind: parseBrokerEndpoint(endpoint).kind,
+        ...(outcome.spawnErrorCode ? { spawnErrorCode: outcome.spawnErrorCode } : {})
+      };
+    } finally {
+      // A broker that never came up (e.g. its agent hung during initialize)
+      // must not linger detached and untracked, even if evidence capture fails.
+      teardownBrokerSession({
+        endpoint,
+        pidFile,
+        logFile,
+        sessionDir,
+        pid: child.pid ?? null,
+        killProcess: killImpl
+      });
+    }
+    const outcomeLabel = outcome.reason === "child-exit"
+      ? signal ? `child exited with signal ${signal}` : `child exited with code ${exitCode ?? "unknown"}`
+      : outcome.reason === "spawn-error"
+        ? `child spawn failed${outcome.spawnErrorCode ? ` (${outcome.spawnErrorCode})` : ""}`
+        : "readiness timed out";
+    throw new BrokerStartupError(`Failed to start the shared agent broker (${outcomeLabel}).`, brokerStartup);
   }
 
   const session = {

@@ -510,7 +510,8 @@ async function handleReview(argv) {
         label: target.label,
         diffSha256: target.diffSha256,
         byteCount: target.byteCount
-      }
+      },
+      ...(error?.data?.brokerStartup ? { brokerStartup: error.data.brokerStartup } : {})
     });
   }
 }

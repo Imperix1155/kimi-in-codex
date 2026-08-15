@@ -12,7 +12,14 @@ Review one frozen diff artifact without substituting mutable repository state.
 1. Require both the artifact path and its 64-hex SHA-256. If either is absent, stop and report `NOT REVIEWED: frozen diff path and SHA-256 are required.`
 2. Set `DIFF_FILE` and `DIFF_SHA256` from the supplied values without recomputing, rewriting, or summarizing the artifact.
 3. If `PLUGIN_ROOT` is unset, resolve the plugin root from this `SKILL.md` path: it is the ancestor containing `.codex-plugin/plugin.json`.
-4. Run exactly once in the foreground:
+4. Run exactly once in the foreground with the Codex shell tool configured as follows:
+
+   - `sandbox_permissions: "require_escalated"`
+   - `justification: "Allow the authenticated local Kimi runtime to run with normal user filesystem authority (not an OS sandbox) so it can access ~/.kimi state/logs and its model service? Review policy still uses an empty session cwd and reject-only ACP permissions."`
+
+   Do not first attempt the command inside the sandbox. Kimi requires its local authenticated state and outbound model connection; the elevated call below is the single review invocation.
+
+   If the elevated execution is denied, no runtime JSON exists: report `NOT REVIEWED: required Kimi runtime permission was denied.` Do not retry.
 
    ```bash
    node "${PLUGIN_ROOT}/scripts/kimi-companion.mjs" review --diff-file "${DIFF_FILE}" --diff-sha256 "${DIFF_SHA256}" --json
@@ -30,6 +37,7 @@ Review one frozen diff artifact without substituting mutable repository state.
 ## Integrity rules
 
 - Do not retry against `git diff`, a working tree, a branch, or another artifact.
+- Do not retry after a denied or failed elevated execution.
 - Do not run in the background or route through status/result/cancel workflows.
 - Do not edit, apply, or delete the artifact.
 - Do not describe a failed or unavailable Kimi leg as clean, approved, or reviewed.
