@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import { AcpClient, BROKER_BUSY_RPC_CODE } from "../scripts/lib/acp-client.mjs";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "../scripts/lib/broker-endpoint.mjs";
 import {
+  BROKER_LOG_TAIL_BYTES,
+  BrokerStartupError,
   clearBrokerSessionIfEndpoint,
   ensureBrokerSession,
   loadBrokerSession,
@@ -19,7 +21,6 @@ import {
 import { newSession, runPromptTurn } from "../scripts/lib/kimi.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
-const EXPECTED_BROKER_LOG_TAIL_BYTES = 8 * 1024;
 
 // The whole suite dies loudly rather than hanging a CI-less gate.
 const deadman = setTimeout(() => {
@@ -369,6 +370,7 @@ await withBroker("basic", async (session, cwd) => {
     failure = error;
   }
   assert.ok(failure, "an ACP child startup failure must reject the broker connect");
+  assert.ok(failure instanceof BrokerStartupError);
   assert.equal(failure.data?.brokerStartup?.reason, "child-exit");
   assert.equal(failure.data?.brokerStartup?.exitCode, 1);
   assert.equal(failure.data?.brokerStartup?.signal, null);
@@ -401,7 +403,7 @@ await withBroker("basic", async (session, cwd) => {
   const evidence = failure.data?.brokerStartup;
   assert.equal(evidence?.reason, "child-exit");
   assert.equal(evidence?.logTruncated, true);
-  assert.ok(Buffer.byteLength(evidence?.logTail ?? "", "utf8") <= EXPECTED_BROKER_LOG_TAIL_BYTES);
+  assert.ok(Buffer.byteLength(evidence?.logTail ?? "", "utf8") <= BROKER_LOG_TAIL_BYTES);
   assert.doesNotMatch(evidence?.logTail ?? "", /BROKER-LOG-BEGIN/);
   assert.match(evidence?.logTail ?? "", /BROKER-LOG-END/);
 }
