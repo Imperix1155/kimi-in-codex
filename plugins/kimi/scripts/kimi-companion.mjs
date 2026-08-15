@@ -280,7 +280,9 @@ function readFrozenDiffArtifact(cwd, fileOption, shaOption) {
 
   let text;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    // ignoreBOM means "do not treat the BOM specially": preserve it in the
+    // decoded string so the text sent to Kimi re-encodes to the hashed bytes.
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
     throw new NotReviewedError("Frozen diff artifact is not valid UTF-8.", {
       expectedDiffSha256,
@@ -449,7 +451,8 @@ async function handleReview(argv) {
   // Normalize to the repository root BEFORE resolving the target: from a
   // subdirectory, git only reports untracked files below the cwd, so auto
   // scope could silently review the wrong thing (or nothing).
-  const repoRoot = ensureGitRepository(resolveCommandCwd(options));
+  const commandCwd = resolveCommandCwd(options);
+  const repoRoot = ensureGitRepository(commandCwd);
   const workspaceRoot = resolveWorkspaceRoot(repoRoot);
   const model = resolveRequestedModel(options.model);
   const focusText = positionals.join(" ").trim();
@@ -458,7 +461,7 @@ async function handleReview(argv) {
     throw new NotReviewedError("Frozen review cannot be combined with --base, --scope, or --background.");
   }
   const frozenArtifact = frozenRequested
-    ? readFrozenDiffArtifact(repoRoot, options["diff-file"], options["diff-sha256"])
+    ? readFrozenDiffArtifact(commandCwd, options["diff-file"], options["diff-sha256"])
     : null;
   const target = frozenArtifact
     ? buildFrozenReviewContext(repoRoot, frozenArtifact).target
@@ -1046,11 +1049,24 @@ async function main() {
   }
 }
 
+function hasFrozenReviewIntent(argv) {
+  if (argv[0] !== "review") {
+    return false;
+  }
+  return argv.some((arg) =>
+    arg === "--diff-file" ||
+    arg.startsWith("--diff-file=") ||
+    arg === "--diff-sha256" ||
+    arg.startsWith("--diff-sha256=")
+  );
+}
+
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
-  if (error instanceof NotReviewedError) {
+  if (error instanceof NotReviewedError || hasFrozenReviewIntent(process.argv.slice(2))) {
+    const details = error instanceof NotReviewedError ? error.details : {};
     if (process.argv.includes("--json")) {
-      console.log(JSON.stringify({ reviewStatus: "NOT REVIEWED", error: message, ...error.details }, null, 2));
+      console.log(JSON.stringify({ reviewStatus: "NOT REVIEWED", error: message, ...details }, null, 2));
     }
     process.stderr.write(`NOT REVIEWED: ${message}\n`);
     process.exitCode = 1;

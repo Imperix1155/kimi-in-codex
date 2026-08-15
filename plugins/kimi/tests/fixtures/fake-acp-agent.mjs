@@ -98,6 +98,9 @@ rl.on("line", (line) => {
 
   if (message.method === "session/new") {
     observed.sessionCwd = message.params?.cwd ?? null;
+    if (process.env.KIMI_SESSION_CWD_MARKER) {
+      fs.writeFileSync(process.env.KIMI_SESSION_CWD_MARKER, `${observed.sessionCwd}\n`, "utf8");
+    }
     if (scenario === "auth-error") {
       send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
       return;
@@ -245,6 +248,7 @@ rl.on("line", (line) => {
         }
         const expectedText = process.env.KIMI_EXPECTED_FROZEN_TEXT ?? "";
         const liveSentinel = process.env.KIMI_LIVE_SENTINEL ?? "";
+        const artifactPath = process.env.KIMI_FROZEN_ARTIFACT_PATH ?? "";
         const callerCwd = process.env.KIMI_CALLER_CWD ?? "";
         const sessionCwd = observed.sessionCwd ?? "";
         let empty = false;
@@ -254,6 +258,7 @@ rl.on("line", (line) => {
         return [
           `snapshot:${expectedText && reviewPromptText.includes(expectedText)}`,
           `live:${liveSentinel && reviewPromptText.includes(liveSentinel)}`,
+          `path:${artifactPath && reviewPromptText.includes(artifactPath)}`,
           `isolated:${Boolean(sessionCwd) && sessionCwd !== callerCwd}`,
           `empty:${empty}`
         ].join(";");

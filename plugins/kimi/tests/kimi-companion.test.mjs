@@ -572,7 +572,7 @@ function makeGitWorkspace(scenario) {
 {
   const { cwd, env } = makeGitWorkspace("review-frozen-json");
   const frozenText = [
-    "diff --git a/src/math.mjs b/src/math.mjs",
+    "\ufeffdiff --git a/src/math.mjs b/src/math.mjs",
     "--- a/src/math.mjs",
     "+++ b/src/math.mjs",
     "@@ -1 +1 @@",
@@ -585,7 +585,10 @@ function makeGitWorkspace(scenario) {
   fs.writeFileSync(path.join(cwd, "live-only.txt"), `${liveSentinel}\n`, "utf8");
   env.KIMI_EXPECTED_FROZEN_TEXT = frozenText;
   env.KIMI_LIVE_SENTINEL = liveSentinel;
+  env.KIMI_FROZEN_ARTIFACT_PATH = artifact.file;
   env.KIMI_CALLER_CWD = cwd;
+  const sessionCwdMarker = path.join(os.tmpdir(), `kmc-session-cwd-${process.pid}-${Date.now()}`);
+  env.KIMI_SESSION_CWD_MARKER = sessionCwdMarker;
 
   const review = runCli([
     "review",
@@ -600,7 +603,30 @@ function makeGitWorkspace(scenario) {
   assert.equal(payload.target.diffSha256, artifact.sha256);
   assert.equal(payload.target.byteCount, artifact.bytes.length);
   assert.equal(payload.context.inputMode, "frozen-inline-diff");
-  assert.equal(payload.result.summary, "snapshot:true;live:false;isolated:true;empty:true");
+  assert.equal(payload.result.summary, "snapshot:true;live:false;path:false;isolated:true;empty:true");
+  const isolatedSessionCwd = fs.readFileSync(sessionCwdMarker, "utf8").trim();
+  assert.equal(fs.existsSync(isolatedSessionCwd), false, "temporary session cwd must be removed after the turn");
+  shutdownBroker(env, cwd);
+}
+
+// 13b.1. Relative artifact paths are resolved against the command cwd, not
+// silently rebased to the repository root.
+{
+  const { cwd, env } = makeGitWorkspace("review-frozen-json");
+  const subdir = path.join(cwd, "nested");
+  fs.mkdirSync(subdir);
+  const frozenText = "diff --git a/a b/a\n+relative artifact\n";
+  const relativeFile = "final.diff";
+  const bytes = Buffer.from(frozenText, "utf8");
+  fs.writeFileSync(path.join(subdir, relativeFile), bytes);
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  env.KIMI_EXPECTED_FROZEN_TEXT = frozenText;
+  env.KIMI_CALLER_CWD = subdir;
+  const review = runCli([
+    "review", "--diff-file", relativeFile, "--diff-sha256", sha256, "--json"
+  ], { env, cwd: subdir });
+  assert.equal(review.status, 0, `relative frozen review failed: ${review.stderr}`);
+  assert.equal(JSON.parse(review.stdout).target.diffSha256, sha256);
   shutdownBroker(env, cwd);
 }
 
@@ -638,9 +664,12 @@ function makeGitWorkspace(scenario) {
     ["review", "--diff-file", artifact.file, "--diff-sha256", "xyz", "--json"],
     ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--scope", "working-tree", "--json"]
   ]) {
+    const marker = path.join(os.tmpdir(), `kmc-preflight-start-${process.pid}-${Date.now()}-${Math.random()}`);
+    env.KIMI_FAKE_START_MARKER = marker;
     const review = runCli(args, { env, cwd });
     assert.notEqual(review.status, 0);
     assert.equal(JSON.parse(review.stdout).reviewStatus, "NOT REVIEWED");
+    assert.equal(fs.existsSync(marker), false, "preflight failure must occur before the ACP agent starts");
   }
   const empty = writeFrozenDiff("");
   const review = runCli([
@@ -665,6 +694,44 @@ function makeGitWorkspace(scenario) {
   const invalidPayload = JSON.parse(invalidReview.stdout);
   assert.equal(invalidPayload.reviewStatus, "NOT REVIEWED");
   assert.match(invalidPayload.error, /UTF-8/i);
+}
+
+// 13d.1. Every failure on an invocation expressing frozen intent uses the
+// explicit NOT REVIEWED envelope, including errors before artifact loading.
+{
+  const { cwd, env } = makeGitWorkspace("review-frozen-json");
+  const artifact = writeFrozenDiff("diff --git a/a b/a\n+safe\n");
+  for (const args of [
+    ["review", "--json", "--diff-sha256"],
+    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--model", "not-a-model", "--json"]
+  ]) {
+    const review = runCli(args, { env, cwd });
+    assert.notEqual(review.status, 0);
+    assert.equal(JSON.parse(review.stdout).reviewStatus, "NOT REVIEWED");
+  }
+  const outsideGit = makeWorkspace("review-frozen-json");
+  const review = runCli([
+    "review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--json"
+  ], { env: outsideGit.env, cwd: outsideGit.cwd });
+  assert.notEqual(review.status, 0);
+  assert.equal(JSON.parse(review.stdout).reviewStatus, "NOT REVIEWED");
+}
+
+// 13d.2. Frozen reviews exercise the same verified permission rejection path
+// as legacy reviews; a write attempt is rejected and recorded.
+{
+  const { cwd, env } = makeGitWorkspace("review-write-attempt");
+  const artifact = writeFrozenDiff("diff --git a/a b/a\n+read only\n");
+  const review = runCli([
+    "review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--json"
+  ], { env, cwd });
+  assert.equal(review.status, 0, review.stderr);
+  const payload = JSON.parse(review.stdout);
+  assert.equal(payload.reviewStatus, "REVIEWED");
+  assert.equal(payload.permissionRejections, 1);
+  assert.ok(payload.permissionEvents.every((event) => event.decision === "reject"));
+  assert.equal(payload.result.summary, "perm-outcome:no");
+  shutdownBroker(env, cwd);
 }
 
 // 13e. Invalid Kimi output is an explicit NOT REVIEWED result with the

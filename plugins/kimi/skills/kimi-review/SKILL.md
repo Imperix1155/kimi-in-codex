@@ -41,3 +41,9 @@ Review one frozen diff artifact without substituting mutable repository state.
 | Computing a fresh hash after the caller supplied one | Pass the supplied digest; the runtime independently verifies the saved bytes. |
 | Falling back when the hash mismatches | Report `NOT REVIEWED`; the mismatch proves the evidence is stale or wrong. |
 | Reporting only Kimi's verdict | Include the verified SHA-256 and byte count so a coverage ledger can pin the evidence. |
+
+## Gotchas
+
+- 2026-08-15: A successful hash check does not prove the reviewer received the same bytes if UTF-8 decoding strips a BOM. The runtime preserves a leading BOM and the regression suite pins the wire prompt.
+- 2026-08-15: Resolve relative artifact paths against the command's cwd, while keeping repository state rooted at the Git top level.
+- 2026-08-15: Frozen intent must be recognized before argument, repository, and model validation so every failure remains explicit `NOT REVIEWED`.
