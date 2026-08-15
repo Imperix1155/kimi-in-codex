@@ -1,6 +1,7 @@
 // Broker tests: a real detached acp-broker.mjs process serving the scripted
 // fake agent. Run: node plugin/tests/acp-broker.test.mjs  (prints ACP-BROKER-TESTS-GREEN)
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -459,6 +460,44 @@ await withBroker("basic", async (session, cwd) => {
   assert.ok(failedSessionDir);
   assert.equal(fs.existsSync(failedSessionDir), false, "log-read failure must not bypass broker teardown");
   assert.equal(loadBrokerSession(cwd), null);
+}
+
+// 12e. A child spawn failure is distinct from child exit and never exposes
+// the arbitrary, potentially sensitive Error.message.
+{
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
+  let failedSessionDir = null;
+  let failure = null;
+  try {
+    await ensureBrokerSession(cwd, {
+      createBrokerEndpoint(sessionDir, platform) {
+        failedSessionDir = sessionDir;
+        return createBrokerEndpoint(sessionDir, platform);
+      },
+      spawnBrokerProcess() {
+        const child = new EventEmitter();
+        child.pid = null;
+        child.exitCode = null;
+        child.signalCode = null;
+        process.nextTick(() => {
+          const error = new Error(`secret-spawn-marker-${"x".repeat(BROKER_LOG_TAIL_BYTES * 2)}`);
+          error.code = "EACCES";
+          child.emit("error", error);
+        });
+        return child;
+      }
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof BrokerStartupError);
+  assert.equal(failure.data?.brokerStartup?.reason, "spawn-error");
+  assert.equal(failure.data?.brokerStartup?.spawnErrorCode, "EACCES");
+  assert.equal(Object.hasOwn(failure.data?.brokerStartup ?? {}, "spawnError"), false);
+  assert.doesNotMatch(JSON.stringify(failure), /secret-spawn-marker/);
+  assert.match(failure.message, /child spawn failed \(EACCES\)/);
+  assert.ok(failedSessionDir);
+  assert.equal(fs.existsSync(failedSessionDir), false);
 }
 
 // 13. Concurrent ensureBrokerSession: exactly one broker survives in state

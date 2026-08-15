@@ -15,7 +15,7 @@ Review one frozen diff artifact without substituting mutable repository state.
 4. Run exactly once in the foreground with the Codex shell tool configured as follows:
 
    - `sandbox_permissions: "require_escalated"`
-   - `justification: "Allow the authenticated local Kimi runtime to access its ~/.kimi state and logs and its outbound model connection for this read-only frozen review?"`
+   - `justification: "Allow the authenticated local Kimi runtime to run with normal user filesystem authority (not an OS sandbox) so it can access ~/.kimi state/logs and its model service? Review policy still uses an empty session cwd and reject-only ACP permissions."`
 
    Do not first attempt the command inside the sandbox. Kimi requires its local authenticated state and outbound model connection; the elevated call below is the single review invocation.
 

@@ -23,6 +23,7 @@ Do not redirect or copy `KIMI_SHARE_DIR`, Kimi configuration, or OAuth credentia
 Broker startup remains bounded. When the endpoint is not ready, capture evidence before teardown:
 
 - whether the child exited before readiness
+- whether the child failed to spawn, with only an allowlisted error code when available
 - its numeric exit code or terminating signal when known
 - a capped tail of the broker log, with a fixed maximum size
 - the broker script path, working directory, and endpoint kind needed to locate the failing boundary

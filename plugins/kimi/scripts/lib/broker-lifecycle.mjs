@@ -86,7 +86,12 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
 function waitForChildClose(child) {
   return new Promise((resolve) => {
     child.once("close", (exitCode, signal) => resolve({ reason: "child-exit", exitCode, signal }));
-    child.once("error", (error) => resolve({ reason: "child-exit", exitCode: null, signal: null, spawnError: error.message }));
+    child.once("error", (error) => {
+      const spawnErrorCode = typeof error?.code === "string" && /^[A-Z0-9_]+$/.test(error.code)
+        ? error.code
+        : null;
+      resolve({ reason: "spawn-error", exitCode: null, signal: null, spawnErrorCode });
+    });
   });
 }
 
@@ -278,7 +283,7 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
     options.scriptPath ??
     fileURLToPath(new URL("../acp-broker.mjs", import.meta.url));
 
-  const child = spawnBrokerProcess({
+  const child = (options.spawnBrokerProcess ?? spawnBrokerProcess)({
     scriptPath,
     cwd,
     endpoint,
@@ -314,7 +319,7 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
         scriptPath,
         cwd,
         endpointKind: parseBrokerEndpoint(endpoint).kind,
-        ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {})
+        ...(outcome.spawnErrorCode ? { spawnErrorCode: outcome.spawnErrorCode } : {})
       };
     } finally {
       // A broker that never came up (e.g. its agent hung during initialize)
@@ -330,7 +335,9 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
     }
     const outcomeLabel = outcome.reason === "child-exit"
       ? signal ? `child exited with signal ${signal}` : `child exited with code ${exitCode ?? "unknown"}`
-      : "readiness timed out";
+      : outcome.reason === "spawn-error"
+        ? `child spawn failed${outcome.spawnErrorCode ? ` (${outcome.spawnErrorCode})` : ""}`
+        : "readiness timed out";
     throw new BrokerStartupError(`Failed to start the shared agent broker (${outcomeLabel}).`, brokerStartup);
   }
 
