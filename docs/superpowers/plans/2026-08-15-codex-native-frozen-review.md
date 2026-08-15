@@ -64,7 +64,7 @@ Expected: FAIL because `--diff-file` and `--diff-sha256` are unsupported and no 
 
 - [x] **Step 3: Implement verified artifact loading and explicit failures**
 
-Add a `NotReviewedError` carrying optional expected/actual hashes. Add a helper that validates `/^[0-9a-fA-F]{64}$/`, reads one `Buffer`, rejects zero bytes, computes SHA-256, compares with `timingSafeEqual`, and decodes with `new TextDecoder("utf-8", { fatal: true })`. Parse `diff-file` and `diff-sha256` as paired value options and prohibit combining them with `--base`, `--scope`, or `--background`.
+Add a `NotReviewedError` carrying optional expected/actual hashes. Add a helper that validates `/^[0-9a-fA-F]{64}$/`, reads one `Buffer`, rejects zero bytes, computes SHA-256, compares with `timingSafeEqual`, and decodes with `new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })` so a leading BOM remains part of the exact reviewed text. Parse `diff-file` and `diff-sha256` as paired value options and prohibit combining them with `--base`, `--scope`, or `--background`.
 
 For JSON failures, print:
 

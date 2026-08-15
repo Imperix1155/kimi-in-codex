@@ -662,7 +662,10 @@ function makeGitWorkspace(scenario) {
     ["review", "--diff-file", artifact.file, "--json"],
     ["review", "--diff-sha256", artifact.sha256, "--json"],
     ["review", "--diff-file", artifact.file, "--diff-sha256", "xyz", "--json"],
-    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--scope", "working-tree", "--json"]
+    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--scope", "working-tree", "--json"],
+    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--base=", "--json"],
+    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--scope=", "--json"],
+    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--background=false", "--json"]
   ]) {
     const marker = path.join(os.tmpdir(), `kmc-preflight-start-${process.pid}-${Date.now()}-${Math.random()}`);
     env.KIMI_FAKE_START_MARKER = marker;

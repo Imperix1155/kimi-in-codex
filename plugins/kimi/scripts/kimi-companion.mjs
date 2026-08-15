@@ -461,7 +461,10 @@ async function handleReview(argv) {
   const model = resolveRequestedModel(options.model);
   const focusText = positionals.join(" ").trim();
   const frozenRequested = Object.hasOwn(options, "diff-file") || Object.hasOwn(options, "diff-sha256");
-  if (frozenRequested && (options.base || options.scope || options.background)) {
+  const hasIncompatibleFrozenOption = ["base", "scope", "background"].some((option) =>
+    Object.hasOwn(options, option)
+  );
+  if (frozenRequested && hasIncompatibleFrozenOption) {
     throw new NotReviewedError("Frozen review cannot be combined with --base, --scope, or --background.");
   }
   const frozenArtifact = frozenRequested

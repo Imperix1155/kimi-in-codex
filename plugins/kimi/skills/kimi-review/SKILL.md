@@ -48,4 +48,5 @@ Review one frozen diff artifact without substituting mutable repository state.
 - 2026-08-15: Resolve relative artifact paths against the command's cwd, while keeping repository state rooted at the Git top level.
 - 2026-08-15: Frozen intent must be recognized before argument, repository, and model validation so every failure remains explicit `NOT REVIEWED`.
 - 2026-08-15: Option presence, not truthiness, defines frozen intent; explicitly empty values must fail closed instead of falling back to mutable Git state.
+- 2026-08-15: The same presence rule applies to incompatible options; `--base=`, `--scope=`, and `--background=false` are still supplied options and must be rejected.
 - 2026-08-15: Codex slash-command packaging may deliver all review flags as one argument, so failure-envelope detection must normalize that form too.
