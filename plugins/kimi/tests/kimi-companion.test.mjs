@@ -41,7 +41,7 @@ function runCli(args, { env, cwd }) {
 function writeFrozenDiff(text) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-frozen-diff-"));
   const file = path.join(dir, "final.diff");
-  const bytes = Buffer.from(text, "utf8");
+  const bytes = Buffer.isBuffer(text) ? text : Buffer.from(text, "utf8");
   fs.writeFileSync(file, bytes);
   return {
     file,
@@ -635,7 +635,8 @@ function makeGitWorkspace(scenario) {
   for (const args of [
     ["review", "--diff-file", artifact.file, "--json"],
     ["review", "--diff-sha256", artifact.sha256, "--json"],
-    ["review", "--diff-file", artifact.file, "--diff-sha256", "xyz", "--json"]
+    ["review", "--diff-file", artifact.file, "--diff-sha256", "xyz", "--json"],
+    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--scope", "working-tree", "--json"]
   ]) {
     const review = runCli(args, { env, cwd });
     assert.notEqual(review.status, 0);
@@ -652,6 +653,18 @@ function makeGitWorkspace(scenario) {
   const payload = JSON.parse(review.stdout);
   assert.equal(payload.reviewStatus, "NOT REVIEWED");
   assert.match(payload.error, /empty/i);
+
+  const invalidUtf8 = writeFrozenDiff(Buffer.from([0xff, 0xfe, 0xfd]));
+  const invalidReview = runCli([
+    "review",
+    "--diff-file", invalidUtf8.file,
+    "--diff-sha256", invalidUtf8.sha256,
+    "--json"
+  ], { env, cwd });
+  assert.notEqual(invalidReview.status, 0);
+  const invalidPayload = JSON.parse(invalidReview.stdout);
+  assert.equal(invalidPayload.reviewStatus, "NOT REVIEWED");
+  assert.match(invalidPayload.error, /UTF-8/i);
 }
 
 // 13e. Invalid Kimi output is an explicit NOT REVIEWED result with the
@@ -671,6 +684,26 @@ function makeGitWorkspace(scenario) {
   assert.equal(payload.target.diffSha256, artifact.sha256);
   assert.equal(payload.target.byteCount, artifact.bytes.length);
   assert.match(payload.parseError, /not valid JSON/i);
+  shutdownBroker(env, cwd);
+}
+
+// 13f. A verified artifact with unavailable Kimi authentication is still
+// explicit NOT REVIEWED and retains the artifact's provenance.
+{
+  const { cwd, env } = makeGitWorkspace("auth-error");
+  const artifact = writeFrozenDiff("diff --git a/a b/a\n+auth probe\n");
+  const review = runCli([
+    "review",
+    "--diff-file", artifact.file,
+    "--diff-sha256", artifact.sha256,
+    "--json"
+  ], { env, cwd });
+  assert.notEqual(review.status, 0);
+  const payload = JSON.parse(review.stdout);
+  assert.equal(payload.reviewStatus, "NOT REVIEWED");
+  assert.equal(payload.target.diffSha256, artifact.sha256);
+  assert.equal(payload.target.byteCount, artifact.bytes.length);
+  assert.match(payload.error, /not logged in/i);
   shutdownBroker(env, cwd);
 }
 

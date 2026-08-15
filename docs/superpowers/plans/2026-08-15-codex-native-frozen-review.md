@@ -158,7 +158,7 @@ Update plugin copy to advertise setup plus frozen adversarial review, while stil
 Run:
 
 ```bash
-python3 /Users/imperix/.codex/skills/.system/skill-creator/scripts/quick_validate.py plugins/kimi/skills/kimi-review && node plugins/kimi/tests/codex-plugin-surface.test.mjs && echo GATE-GREEN || echo GATE-FAILED
+python3 ~/.codex/skills/.system/skill-creator/scripts/quick_validate.py plugins/kimi/skills/kimi-review && node plugins/kimi/tests/codex-plugin-surface.test.mjs && echo GATE-GREEN || echo GATE-FAILED
 ```
 
 Expected: `Skill is valid!`, `CODEX-PLUGIN-SURFACE-GREEN`, `GATE-GREEN`.
@@ -183,23 +183,23 @@ git commit -m "feat: add native frozen Kimi review skill"
 - Consumes: verified runtime and skill behavior
 - Produces: public documentation that distinguishes supported frozen review from deferred workflow orchestration
 
-- [ ] **Step 1: Update the closest owning documentation**
+- [x] **Step 1: Update the closest owning documentation**
 
 Document the exact command/skill contract, SHA-256 provenance, isolation, explicit failure semantics, and local-only auth. Mark only the frozen foreground review slice complete. Keep mutable Git review, background/status/result/cancel, hooks, task, rescue, automatic freezing/ledger orchestration, and MCP deferred.
 
-- [ ] **Step 2: Run validators and the deterministic battery**
+- [x] **Step 2: Run validators and the deterministic battery**
 
 Run the plugin validator, both skill validators, package surfaces, and all six engine suites. Confirm each named `*-GREEN` sentinel and finish with `GATE-GREEN`.
 
-- [ ] **Step 3: Run a safe live frozen review**
+- [x] **Step 3: Run a safe live frozen review**
 
 Create a temporary UTF-8 diff outside the repository, compute SHA-256, invoke frozen review with `--json`, and verify `reviewStatus`, `target.diffSha256`, `target.byteCount`, structured verdict, and zero permission grants. If local Kimi authentication is unavailable, record `NOT REVIEWED` and do not simulate success.
 
-- [ ] **Step 4: Run the DOX and secret/state checks**
+- [x] **Step 4: Run the DOX and secret/state checks**
 
 Confirm the source checkout is clean and unchanged, target docs match the changed surfaces, `git diff --check` passes, no local paths or credential patterns were introduced, and the target worktree contains only intended changes.
 
-- [ ] **Step 5: Commit locally and stop before publication**
+- [x] **Step 5: Commit locally and stop before publication**
 
 ```bash
 git add AGENTS.md README.md docs/PLAN.md docs/ROADMAP.md docs/superpowers/plans/2026-08-15-codex-native-frozen-review.md

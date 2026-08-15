@@ -60,10 +60,11 @@
 - [x] **KMP-28** ✅ 2026-08-15 — created an independent `kimi-in-codex` history copy; source remote is fetch-only locally; public target repository created; full-history gitleaks scan clean before publication.
 - [x] **KMP-29** ✅ 2026-08-15 — native Codex package walking slice: repo marketplace, `.codex-plugin/plugin.json`, `$kimi-setup`, focused package test, and retained engine at `plugins/kimi`.
 - [ ] **KMP-30** Port and verify Codex-native task delegation, including write/read-only policy and resume semantics.
-- [ ] **KMP-31** Port and verify Codex-native adversarial review and its client-enforced read-only guarantee.
+- [x] **KMP-31** ✅ 2026-08-15 — native frozen adversarial review: caller supplies one UTF-8 diff artifact plus SHA-256; runtime verifies the retained bytes before Kimi starts, inlines exactly that snapshot, isolates the read-only ACP session from the live checkout, schema-validates findings, and returns hash/byte provenance. Every evidence/runtime/structure failure is explicit `NOT REVIEWED`; mutable and background review orchestration remain deferred.
 - [ ] **KMP-32** Port and verify status, result, cancellation, and background-job recovery.
 - [ ] **KMP-33** Decide and verify the Codex replacement for rescue-agent routing.
 - [ ] **KMP-34** Port lifecycle hooks and Codex `PLUGIN_DATA` state only after runtime tests cover the semantic differences.
+- [ ] **KMP-35** Port automatic diff freezing, SHA-pinned coverage-ledger orchestration, and mutable working-tree/branch review only with separate drift tests.
 
 ---
 

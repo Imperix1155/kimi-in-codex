@@ -28,7 +28,9 @@ function listFiles(dir, extension) {
 const surfaceFiles = [
   ...listFiles("commands", ".md"),
   ...listFiles("agents", ".md"),
-  ...listFiles("skills", ".md").filter((file) => !file.includes(`${path.sep}kimi-setup${path.sep}`)),
+  ...listFiles("skills", ".md").filter(
+    (file) => !fs.existsSync(path.join(path.dirname(file), "agents", "openai.yaml"))
+  ),
   ...listFiles("prompts", ".md"),
   path.join(ROOT, "hooks", "hooks.json"),
   path.join(ROOT, ".claude-plugin", "plugin.json")
