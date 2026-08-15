@@ -34,7 +34,7 @@
 - Produces: nonzero failure payload `{ reviewStatus: "NOT REVIEWED", error, expectedDiffSha256?, actualDiffSha256? }`
 - Produces: `runKimiTurn(cwd, { sessionCwd })`, where broker state uses `cwd` and `session/new` uses `sessionCwd`
 
-- [ ] **Step 1: Write failing runtime tests**
+- [x] **Step 1: Write failing runtime tests**
 
 Add cases that create a UTF-8 patch buffer and assert:
 
@@ -52,7 +52,7 @@ assert.equal(payload.target.byteCount, Buffer.byteLength(diff));
 
 Also assert a malformed digest, mismatch, empty file, missing paired option, invalid structured Kimi response, and granted permission all exit nonzero with `reviewStatus: "NOT REVIEWED"`. For mismatch, configure the fake agent with a startup-marker path and assert the marker does not exist.
 
-- [ ] **Step 2: Run the focused suite and confirm RED**
+- [x] **Step 2: Run the focused suite and confirm RED**
 
 Run:
 
@@ -62,7 +62,7 @@ node plugins/kimi/tests/kimi-companion.test.mjs
 
 Expected: FAIL because `--diff-file` and `--diff-sha256` are unsupported and no provenance fields exist.
 
-- [ ] **Step 3: Implement verified artifact loading and explicit failures**
+- [x] **Step 3: Implement verified artifact loading and explicit failures**
 
 Add a `NotReviewedError` carrying optional expected/actual hashes. Add a helper that validates `/^[0-9a-fA-F]{64}$/`, reads one `Buffer`, rejects zero bytes, computes SHA-256, compares with `timingSafeEqual`, and decodes with `new TextDecoder("utf-8", { fatal: true })`. Parse `diff-file` and `diff-sha256` as paired value options and prohibit combining them with `--base`, `--scope`, or `--background`.
 
@@ -79,7 +79,7 @@ For JSON failures, print:
 
 For text failures, print `NOT REVIEWED: <reason>` to stderr and exit nonzero.
 
-- [ ] **Step 4: Implement exact prompt input and isolated session cwd**
+- [x] **Step 4: Implement exact prompt input and isolated session cwd**
 
 Build frozen context directly from the verified buffer:
 
@@ -97,7 +97,7 @@ Build frozen context directly from the verified buffer:
 
 Create an empty directory with `fs.mkdtempSync(path.join(os.tmpdir(), "kimi-frozen-review-"))`; pass it as `sessionCwd` to `runKimiTurn`, then remove it in `finally`. Update `runKimiTurn` so only `session/new`/`session/load` receive `sessionCwd ?? cwd`; connection and state remain on `cwd`.
 
-- [ ] **Step 5: Verify GREEN and commit the runtime unit**
+- [x] **Step 5: Verify GREEN and commit the runtime unit**
 
 Run:
 

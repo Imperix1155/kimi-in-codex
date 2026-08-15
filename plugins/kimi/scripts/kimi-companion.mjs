@@ -7,13 +7,15 @@
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import { collectReviewContext, ensureGitRepository, getCurrentBranch, resolveReviewTarget } from "./lib/git.mjs";
 import {
   assertReadOnlyPermissionEvents,
   cancelKimiSession,
@@ -69,11 +71,20 @@ const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 // embeds in its prompt; task metadata keys off it.
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
+class NotReviewedError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "NotReviewedError";
+    this.details = details;
+  }
+}
+
 function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node <plugin-root>/scripts/kimi-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <id|highspeed|k3>] [focus text]",
+      "  node <plugin-root>/scripts/kimi-companion.mjs review --diff-file <path> --diff-sha256 <64-hex> [--wait] [--model <id|highspeed|k3>] [focus text]",
+      "  node <plugin-root>/scripts/kimi-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <id|highspeed|k3>] [focus text]  # legacy live-Git mode",
       "  node <plugin-root>/scripts/kimi-companion.mjs task [--background] [--write|--read-only] [--resume-last|--resume|--fresh] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
       "  node <plugin-root>/scripts/kimi-companion.mjs status [job-id] [--all] [--wait] [--json]",
       "  node <plugin-root>/scripts/kimi-companion.mjs result [job-id] [--json]",
@@ -233,23 +244,108 @@ function buildReviewPrompt(context, focusText) {
   });
 }
 
+function readFrozenDiffArtifact(cwd, fileOption, shaOption) {
+  if (!fileOption || !shaOption) {
+    throw new NotReviewedError("Frozen review requires both --diff-file and --diff-sha256.");
+  }
+
+  const expectedDiffSha256 = String(shaOption).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(expectedDiffSha256)) {
+    throw new NotReviewedError("Frozen review requires --diff-sha256 to be exactly 64 hexadecimal characters.");
+  }
+
+  const file = path.resolve(cwd, fileOption);
+  let bytes;
+  try {
+    bytes = fs.readFileSync(file);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new NotReviewedError(`Could not read frozen diff artifact: ${detail}`, { expectedDiffSha256 });
+  }
+  if (bytes.length === 0) {
+    throw new NotReviewedError("Frozen diff artifact is empty.", { expectedDiffSha256, byteCount: 0 });
+  }
+
+  const actualDiffSha256 = crypto.createHash("sha256").update(bytes).digest("hex");
+  const matches = crypto.timingSafeEqual(
+    Buffer.from(expectedDiffSha256, "hex"),
+    Buffer.from(actualDiffSha256, "hex")
+  );
+  if (!matches) {
+    throw new NotReviewedError("Frozen diff SHA-256 mismatch.", {
+      expectedDiffSha256,
+      actualDiffSha256
+    });
+  }
+
+  let text;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new NotReviewedError("Frozen diff artifact is not valid UTF-8.", {
+      expectedDiffSha256,
+      actualDiffSha256,
+      byteCount: bytes.length
+    });
+  }
+
+  return {
+    text,
+    diffSha256: actualDiffSha256,
+    byteCount: bytes.length
+  };
+}
+
+function buildFrozenReviewContext(repoRoot, artifact) {
+  const label = `frozen diff sha256:${artifact.diffSha256}`;
+  return {
+    cwd: repoRoot,
+    repoRoot,
+    branch: getCurrentBranch(repoRoot),
+    target: {
+      mode: "frozen-diff",
+      label,
+      diffSha256: artifact.diffSha256,
+      byteCount: artifact.byteCount
+    },
+    fileCount: null,
+    diffBytes: artifact.byteCount,
+    inputMode: "frozen-inline-diff",
+    collectionGuidance: "The inlined frozen diff is the complete review evidence. Do not inspect the live repository or use tools to collect other content.",
+    mode: "frozen-diff",
+    summary: `Reviewing frozen diff ${artifact.diffSha256} (${artifact.byteCount} bytes).`,
+    content: artifact.text,
+    changedFiles: []
+  };
+}
+
 async function executeReviewRun(request) {
   ensureKimiAvailable(request.cwd);
   ensureGitRepository(request.cwd);
 
-  const target = resolveReviewTarget(request.cwd, {
-    base: request.base,
-    scope: request.scope
-  });
-  const context = collectReviewContext(request.cwd, target);
+  const context = request.frozenArtifact
+    ? buildFrozenReviewContext(request.cwd, request.frozenArtifact)
+    : collectReviewContext(
+        request.cwd,
+        resolveReviewTarget(request.cwd, {
+          base: request.base,
+          scope: request.scope
+        })
+      );
+  const target = context.target;
   const prompt = buildReviewPrompt(context, request.focusText ?? "");
 
   let result;
+  let isolatedSessionCwd = null;
   try {
+    if (request.frozenArtifact) {
+      isolatedSessionCwd = fs.mkdtempSync(path.join(os.tmpdir(), "kimi-frozen-review-"));
+    }
     result = await runKimiTurn(context.repoRoot, {
       prompt,
       write: false,
       model: request.model,
+      sessionCwd: isolatedSessionCwd ?? context.repoRoot,
       onProgress: request.onProgress
     });
   } catch (error) {
@@ -257,6 +353,10 @@ async function executeReviewRun(request) {
       throw new Error("The shared Kimi runtime is busy with another turn. Check /kimi:status, wait for it to finish, or /kimi:cancel <job-id> to stop it.");
     }
     throw error;
+  } finally {
+    if (isolatedSessionCwd) {
+      fs.rmSync(isolatedSessionCwd, { recursive: true, force: true });
+    }
   }
 
   // The JSON contract targets the FINAL message; fall back to the full turn
@@ -287,9 +387,16 @@ async function executeReviewRun(request) {
     ? validateReviewResultShape(parsed.parsed)
     : parsed.parseError || "No structured result.";
 
+  const reviewed = result.status === 0 && !structuralError;
   const payload = {
+    reviewStatus: reviewed ? "REVIEWED" : "NOT REVIEWED",
     review: "Review",
-    target: { mode: target.mode, label: target.label },
+    target: {
+      mode: target.mode,
+      label: target.label,
+      ...(target.diffSha256 ? { diffSha256: target.diffSha256 } : {}),
+      ...(Number.isInteger(target.byteCount) ? { byteCount: target.byteCount } : {})
+    },
     status: result.status,
     stopReason: result.stopReason,
     sessionId: result.sessionId,
@@ -332,7 +439,7 @@ async function executeReviewRun(request) {
 
 async function handleReview(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "diff-file", "diff-sha256"],
     // --wait/--background are Claude-side execution control: the command
     // markdown decides whether the Bash call detaches. Accepted and ignored.
     booleanOptions: ["json", "background", "wait"],
@@ -346,7 +453,16 @@ async function handleReview(argv) {
   const workspaceRoot = resolveWorkspaceRoot(repoRoot);
   const model = resolveRequestedModel(options.model);
   const focusText = positionals.join(" ").trim();
-  const target = resolveReviewTarget(repoRoot, { base: options.base, scope: options.scope });
+  const frozenRequested = Boolean(options["diff-file"] || options["diff-sha256"]);
+  if (frozenRequested && (options.base || options.scope || options.background)) {
+    throw new NotReviewedError("Frozen review cannot be combined with --base, --scope, or --background.");
+  }
+  const frozenArtifact = frozenRequested
+    ? readFrozenDiffArtifact(repoRoot, options["diff-file"], options["diff-sha256"])
+    : null;
+  const target = frozenArtifact
+    ? buildFrozenReviewContext(repoRoot, frozenArtifact).target
+    : resolveReviewTarget(repoRoot, { base: options.base, scope: options.scope });
 
   const job = createJobRecord({
     id: generateJobId("review"),
@@ -358,19 +474,35 @@ async function handleReview(argv) {
     summary: `Review ${target.label}`
   });
 
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeReviewRun({
-        cwd: repoRoot,
-        base: options.base,
-        scope: options.scope,
-        model,
-        focusText,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  try {
+    await runForegroundCommand(
+      job,
+      (progress) =>
+        executeReviewRun({
+          cwd: repoRoot,
+          base: options.base,
+          scope: options.scope,
+          frozenArtifact,
+          model,
+          focusText,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  } catch (error) {
+    if (!frozenArtifact || error instanceof NotReviewedError) {
+      throw error;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    throw new NotReviewedError(message, {
+      target: {
+        mode: target.mode,
+        label: target.label,
+        diffSha256: target.diffSha256,
+        byteCount: target.byteCount
+      }
+    });
+  }
 }
 
 async function executeTaskRun(request) {
@@ -916,6 +1048,14 @@ async function main() {
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof NotReviewedError) {
+    if (process.argv.includes("--json")) {
+      console.log(JSON.stringify({ reviewStatus: "NOT REVIEWED", error: message, ...error.details }, null, 2));
+    }
+    process.stderr.write(`NOT REVIEWED: ${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
   if (process.argv.includes("--json")) {
     console.log(JSON.stringify({ error: message }));
   }

@@ -4,6 +4,11 @@
 // assert on the client's answers.
 import process from "node:process";
 import readline from "node:readline";
+import fs from "node:fs";
+
+if (process.env.KIMI_FAKE_START_MARKER) {
+  fs.writeFileSync(process.env.KIMI_FAKE_START_MARKER, "started\n", "utf8");
+}
 
 const scenario = process.argv[2] ?? "basic";
 const rl = readline.createInterface({ input: process.stdin });
@@ -92,6 +97,7 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "session/new") {
+    observed.sessionCwd = message.params?.cwd ?? null;
     if (scenario === "auth-error") {
       send({ id: message.id, error: { code: -32000, message: "Authentication required" } });
       return;
@@ -224,7 +230,7 @@ rl.on("line", (line) => {
       return;
     }
 
-    if (scenario === "review-json") {
+    if (scenario === "review-json" || scenario === "review-frozen-json") {
       // KMP-24: the review path must never receive the generic task
       // preamble — fail the review loudly if it leaks (wire-level pin).
       const reviewPromptText = (message.params.prompt ?? []).map((block) => block?.text ?? "").join("");
@@ -233,9 +239,28 @@ rl.on("line", (line) => {
         send({ id: message.id, result: { stopReason: "end_turn" } });
         return;
       }
+      const frozenSummary = (() => {
+        if (scenario !== "review-frozen-json") {
+          return "Ship blocker: planted divide-by-zero found.";
+        }
+        const expectedText = process.env.KIMI_EXPECTED_FROZEN_TEXT ?? "";
+        const liveSentinel = process.env.KIMI_LIVE_SENTINEL ?? "";
+        const callerCwd = process.env.KIMI_CALLER_CWD ?? "";
+        const sessionCwd = observed.sessionCwd ?? "";
+        let empty = false;
+        try {
+          empty = fs.readdirSync(sessionCwd).length === 0;
+        } catch {}
+        return [
+          `snapshot:${expectedText && reviewPromptText.includes(expectedText)}`,
+          `live:${liveSentinel && reviewPromptText.includes(liveSentinel)}`,
+          `isolated:${Boolean(sessionCwd) && sessionCwd !== callerCwd}`,
+          `empty:${empty}`
+        ].join(";");
+      })();
       const review = {
         verdict: "needs-attention",
-        summary: "Ship blocker: planted divide-by-zero found.",
+        summary: frozenSummary,
         findings: [{
           severity: "high",
           title: "Planted divide-by-zero",

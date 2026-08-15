@@ -617,6 +617,8 @@ export async function runKimiTurn(cwd, options = {}) {
     }
   };
 
+  const sessionCwd = options.sessionCwd ?? cwd;
+
   return withKimiClient(cwd, async (client) => {
     const decision = options.write ? "allow" : "reject";
     let sessionId;
@@ -624,7 +626,7 @@ export async function runKimiTurn(cwd, options = {}) {
     if (options.resumeSessionId) {
       emitProgress(options.onProgress, `Loading session ${options.resumeSessionId}.`, "starting");
       try {
-        await client.request("session/load", { sessionId: options.resumeSessionId, cwd, mcpServers: [] });
+        await client.request("session/load", { sessionId: options.resumeSessionId, cwd: sessionCwd, mcpServers: [] });
       } catch (error) {
         rethrowWithLoginHint(profile, error);
       }
@@ -634,7 +636,7 @@ export async function runKimiTurn(cwd, options = {}) {
       emitProgress(options.onProgress, "Starting Kimi session.", "starting");
       let session;
       try {
-        session = await newSession(client, cwd, { permissionDecision: decision });
+        session = await newSession(client, sessionCwd, { permissionDecision: decision });
       } catch (error) {
         rethrowWithLoginHint(profile, error);
       }
