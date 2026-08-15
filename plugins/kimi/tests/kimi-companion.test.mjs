@@ -703,7 +703,8 @@ function makeGitWorkspace(scenario) {
   const artifact = writeFrozenDiff("diff --git a/a b/a\n+safe\n");
   for (const args of [
     ["review", "--json", "--diff-sha256"],
-    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--model", "not-a-model", "--json"]
+    ["review", "--diff-file", artifact.file, "--diff-sha256", artifact.sha256, "--model", "not-a-model", "--json"],
+    ["review", `--diff-file ${artifact.file} --diff-sha256 ${artifact.sha256} --model not-a-model --json`]
   ]) {
     const review = runCli(args, { env, cwd });
     assert.notEqual(review.status, 0);
@@ -715,6 +716,15 @@ function makeGitWorkspace(scenario) {
   ], { env: outsideGit.env, cwd: outsideGit.cwd });
   assert.notEqual(review.status, 0);
   assert.equal(JSON.parse(review.stdout).reviewStatus, "NOT REVIEWED");
+
+  const marker = path.join(os.tmpdir(), `kmc-empty-option-start-${process.pid}-${Date.now()}`);
+  env.KIMI_FAKE_START_MARKER = marker;
+  const emptyOptions = runCli([
+    "review", "--diff-file=", "--diff-sha256=", "--json"
+  ], { env, cwd });
+  assert.notEqual(emptyOptions.status, 0);
+  assert.equal(JSON.parse(emptyOptions.stdout).reviewStatus, "NOT REVIEWED");
+  assert.equal(fs.existsSync(marker), false, "empty frozen options must not fall back to a live review");
 }
 
 // 13d.2. Frozen reviews exercise the same verified permission rejection path
@@ -751,6 +761,7 @@ function makeGitWorkspace(scenario) {
   assert.equal(payload.target.diffSha256, artifact.sha256);
   assert.equal(payload.target.byteCount, artifact.bytes.length);
   assert.match(payload.parseError, /not valid JSON/i);
+  assert.match(payload.error, /not valid JSON/i);
   shutdownBroker(env, cwd);
 }
 

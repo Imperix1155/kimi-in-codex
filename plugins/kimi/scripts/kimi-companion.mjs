@@ -390,8 +390,12 @@ async function executeReviewRun(request) {
     : parsed.parseError || "No structured result.";
 
   const reviewed = result.status === 0 && !structuralError;
+  const reviewError = reviewed
+    ? null
+    : String(structuralError || result.stderr || `Kimi review failed with status ${result.status}.`);
   const payload = {
     reviewStatus: reviewed ? "REVIEWED" : "NOT REVIEWED",
+    ...(reviewError ? { error: reviewError } : {}),
     review: "Review",
     target: {
       mode: target.mode,
@@ -456,7 +460,7 @@ async function handleReview(argv) {
   const workspaceRoot = resolveWorkspaceRoot(repoRoot);
   const model = resolveRequestedModel(options.model);
   const focusText = positionals.join(" ").trim();
-  const frozenRequested = Boolean(options["diff-file"] || options["diff-sha256"]);
+  const frozenRequested = Object.hasOwn(options, "diff-file") || Object.hasOwn(options, "diff-sha256");
   if (frozenRequested && (options.base || options.scope || options.background)) {
     throw new NotReviewedError("Frozen review cannot be combined with --base, --scope, or --background.");
   }
@@ -1061,18 +1065,29 @@ function hasFrozenReviewIntent(argv) {
   );
 }
 
+function normalizeProcessCommandArgv(argv) {
+  const [subcommand, ...commandArgv] = argv;
+  return subcommand ? [subcommand, ...normalizeArgv(commandArgv)] : [];
+}
+
+function requestsJsonOutput(argv) {
+  return argv.some((arg) => arg === "--json" || (arg.startsWith("--json=") && arg !== "--json=false"));
+}
+
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
-  if (error instanceof NotReviewedError || hasFrozenReviewIntent(process.argv.slice(2))) {
+  const normalizedArgv = normalizeProcessCommandArgv(process.argv.slice(2));
+  const jsonOutput = requestsJsonOutput(normalizedArgv);
+  if (error instanceof NotReviewedError || hasFrozenReviewIntent(normalizedArgv)) {
     const details = error instanceof NotReviewedError ? error.details : {};
-    if (process.argv.includes("--json")) {
+    if (jsonOutput) {
       console.log(JSON.stringify({ reviewStatus: "NOT REVIEWED", error: message, ...details }, null, 2));
     }
     process.stderr.write(`NOT REVIEWED: ${message}\n`);
     process.exitCode = 1;
     return;
   }
-  if (process.argv.includes("--json")) {
+  if (jsonOutput) {
     console.log(JSON.stringify({ error: message }));
   }
   process.stderr.write(`${message}\n`);
