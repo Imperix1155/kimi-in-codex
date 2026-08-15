@@ -55,6 +55,16 @@
 - [ ] **KMP-18** OpenCode agent profile. _(PLAN §9)_
 - [ ] **KMP-19** v2: MCP-server skin over the engine (delegation from any MCP-capable harness). _(PLAN §9)_
 
+## Epic 6 — Native Codex port
+
+- [x] **KMP-28** ✅ 2026-08-15 — created an independent `kimi-in-codex` history copy; source remote is fetch-only locally; public target repository created; full-history gitleaks scan clean before publication.
+- [x] **KMP-29** ✅ 2026-08-15 — native Codex package walking slice: repo marketplace, `.codex-plugin/plugin.json`, `$kimi-setup`, focused package test, and retained engine at `plugins/kimi`.
+- [ ] **KMP-30** Port and verify Codex-native task delegation, including write/read-only policy and resume semantics.
+- [ ] **KMP-31** Port and verify Codex-native adversarial review and its client-enforced read-only guarantee.
+- [ ] **KMP-32** Port and verify status, result, cancellation, and background-job recovery.
+- [ ] **KMP-33** Decide and verify the Codex replacement for rescue-agent routing.
+- [ ] **KMP-34** Port lifecycle hooks and Codex `PLUGIN_DATA` state only after runtime tests cover the semantic differences.
+
 ---
 
 ## Tracking rules

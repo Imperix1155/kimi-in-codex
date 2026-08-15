@@ -1,9 +1,9 @@
-// Plugin-surface lint: the user-facing plugin files (commands, agents,
-// skills, hooks, prompts, manifest) must be internally consistent — no
+// Claude-compatibility surface lint: the legacy commands, agents, skills,
+// hooks, prompts, and manifest must remain internally consistent — no
 // stale codex references, no invocations of scripts that don't exist, no
 // broken agent->skill links. This is the regression guard that would have
 // caught commands/setup.md still invoking the deleted codex script.
-// Run: node plugin/tests/plugin-surface.test.mjs  (prints PLUGIN-SURFACE-TESTS-GREEN)
+// Run: node plugins/kimi/tests/plugin-surface.test.mjs  (prints PLUGIN-SURFACE-TESTS-GREEN)
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -28,7 +28,7 @@ function listFiles(dir, extension) {
 const surfaceFiles = [
   ...listFiles("commands", ".md"),
   ...listFiles("agents", ".md"),
-  ...listFiles("skills", ".md"),
+  ...listFiles("skills", ".md").filter((file) => !file.includes(`${path.sep}kimi-setup${path.sep}`)),
   ...listFiles("prompts", ".md"),
   path.join(ROOT, "hooks", "hooks.json"),
   path.join(ROOT, ".claude-plugin", "plugin.json")
@@ -62,7 +62,7 @@ assert.ok(hooks.hooks.SessionStart && hooks.hooks.SessionEnd, "lifecycle hooks m
 // carries the expected identity, its plugin source resolves to a real
 // plugin manifest, and it leaks no email.
 {
-  const repoRoot = path.dirname(ROOT);
+  const repoRoot = path.resolve(ROOT, "..", "..");
   const marketplacePath = path.join(repoRoot, ".claude-plugin", "marketplace.json");
   assert.ok(fs.existsSync(marketplacePath), "marketplace.json must exist at the repo root (the repo IS the marketplace)");
   {

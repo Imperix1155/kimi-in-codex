@@ -1,8 +1,18 @@
-# Kimi Companion Plugin — Build Plan
+# Kimi in Codex — Build and Port Plan
 
-A Claude Code plugin that delegates reviews and tasks to the Kimi Code CLI, modeled on OpenAI's `codex-plugin-cc` (Apache-2.0, ~5.1k lines, installed locally at `~/.claude/plugins/cache/openai-codex-plugin-cc/codex/1.0.4`).
+This target repository ports the proven Kimi/ACP engine from the separate Claude Code repository into a native Codex plugin. The original repository remains the working Claude fallback and is not edited by this port.
 
-Status: **M1 proven live** (2026-07-15). Feasibility is closed; what remains is ordinary build work.
+Status: **Codex setup slice implemented; broader Codex behaviors deferred.** The historical M1–M4 sections below document the already-proven engine, not Codex wrapper equivalence.
+
+## 0. Codex port boundary (2026-08-15)
+
+Native Codex surface:
+
+- `.agents/plugins/marketplace.json` exposes `plugins/kimi`.
+- `plugins/kimi/.codex-plugin/plugin.json` advertises bundled skills only.
+- `plugins/kimi/skills/kimi-setup` invokes the retained setup probe through the plugin root.
+
+Deferred until independently implemented and verified: task, review, status, result, cancel, rescue, hooks, Codex data naming, and the MCP wrapper. Claude command/agent/hook files remain migration source material and are not advertised by the Codex manifest.
 
 ---
 
@@ -37,18 +47,20 @@ Key difference from codex: ACP is **bidirectional**. The agent sends `session/re
 **As shipped (restructured at KMP-15 — the repo is its own plugin marketplace):**
 
 ```
-kimi-in-claude-code/               (fork lineage: codex-plugin-cc, NOTICE preserved)
-├── .claude-plugin/marketplace.json  (catalog "imperix"; plugin source "./plugin")
+kimi-in-codex/                     (independent history copy; NOTICE preserved)
+├── .agents/plugins/marketplace.json (Codex catalog "imperix")
+├── .claude-plugin/marketplace.json  (legacy compatibility source)
 ├── README.md  LICENSE  NOTICE  AGENTS.md  CLAUDE.md
 ├── docs/        PLAN.md  ROADMAP.md
 ├── spike/       acp-spike.mjs     (M1 feasibility proof + regression check)
-└── plugin/                        (the installable plugin)
-    ├── .claude-plugin/plugin.json
+└── plugins/kimi/                  (the installable Codex plugin)
+    ├── .codex-plugin/plugin.json
+    ├── .claude-plugin/plugin.json (legacy source material)
     ├── hooks/hooks.json
     ├── schemas/review-output.schema.json
     ├── commands/    review.md  task.md  status.md  result.md  cancel.md  setup.md  rescue.md
     ├── agents/      kimi-rescue.md
-    ├── skills/      kimi-cli-runtime/  kimi-result-handling/   (k2-prompting deferred, see §6)
+    ├── skills/      kimi-setup/  kimi-cli-runtime/  kimi-result-handling/
     ├── prompts/     review.md  stop-review-gate.md
     ├── tests/       *.test.mjs + fixtures/fake-acp-agent.mjs   (plain-node suites)
     └── scripts/

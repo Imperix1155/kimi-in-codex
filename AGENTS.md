@@ -1,36 +1,41 @@
-# AGENTS.md — Kimi in Claude Code
+# AGENTS.md — Kimi in Codex
 
 ## Purpose
 
-A Claude Code plugin that delegates code reviews and tasks to the Kimi Code CLI via its ACP server (`kimi acp`), modeled on OpenAI's `codex-plugin-cc`. Public repo: github.com/Imperix1155/kimi-in-claude-code (Apache-2.0).
+A Codex-native plugin that connects Codex to Kimi Code CLI through the existing Agent Client Protocol engine. Public target: `github.com/Imperix1155/kimi-in-codex` (Apache-2.0). The source repository `github.com/Imperix1155/kimi-in-claude-code` is a separate, untouched Claude Code fallback.
 
-**Repo layout (as of KMP-15):** this repo is its own plugin marketplace. `.claude-plugin/marketplace.json` (root) is the catalog `imperix`; the plugin itself lives under [`plugin/`](./plugin) (`source: "./plugin"`), with its manifest at `plugin/.claude-plugin/plugin.json`. Everything the plugin ships — `commands/`, `agents/`, `skills/`, `hooks/`, `prompts/`, `schemas/`, `scripts/`, `tests/` — is under `plugin/`. `spike/`, `docs/`, and the public-facing root files stay at the repo root.
+The current Codex support boundary is deliberately narrow: `kimi-setup` is implemented; task, review, job-control, rescue, and hook surfaces remain migration work and must not be described as equivalent.
 
-## Local Contracts
+## Local contracts
 
-- [`docs/PLAN.md`](./docs/PLAN.md) is the authoritative build plan — architecture, file-by-file buckets, milestone verify gates, locked design decisions, risks, positioning, portability roadmap. Re-read before any build work; update when a milestone lands or a decision flips.
-- [`docs/ROADMAP.md`](./docs/ROADMAP.md) is the work tracker (`KMP-##` checkboxes; the owner decided against a Linear board). Check items off when their verify criterion passes; discovered work gets a new `KMP-##` line under the owning epic — never tracked only in chat.
-- Milestone order is strict: a milestone's verify gate must print green before the next starts (gates in PLAN §5).
-- The reference implementation is the locally installed codex plugin at `~/.claude/plugins/cache/openai-codex-plugin-cc/codex/1.0.4` (Apache-2.0) — copy freely; its attribution is preserved in [`NOTICE`](./NOTICE).
-- Keep [`README.md`](./README.md) status honest: it says pre-release until v1 actually ships.
+- [`docs/PLAN.md`](./docs/PLAN.md) owns architecture, port scope, gates, and deferred surfaces.
+- [`docs/ROADMAP.md`](./docs/ROADMAP.md) is the issue tracker (`KMP-##` checkboxes).
+- The native plugin lives at [`plugins/kimi/`](./plugins/kimi), with its manifest at `plugins/kimi/.codex-plugin/plugin.json`.
+- The repository marketplace is [`.agents/plugins/marketplace.json`](./.agents/plugins/marketplace.json).
+- Preserve the proven Node/ACP engine unless a port requirement has a test that demonstrates the needed change.
+- Do not modify a checkout of the separate `Imperix1155/kimi-in-claude-code` source repository.
 
-## Work Guidance
+## Runtime contracts
 
-- The read-only guarantee for reviews is enforced by OUR permission handler (auto-reject `session/request_permission`), not by Kimi — never assume a Kimi-side sandbox exists.
-- ACP is bidirectional: every agent→client request must be answered or the turn hangs. Unknown requests get JSON-RPC `-32601`.
-- State lives at `<data>/kimi/state/<workspace-slug>` where `<data>` is `KIMI_COMPANION_DATA` (our session-hook export, always wins) falling back to `CLAUDE_PLUGIN_DATA` (KMP-23: the generic name leaks across plugins session-wide — the codex hook exports ITS dir — so never export or trust it as ours). A live socket at a recorded broker endpoint proves nothing about WHOSE broker it is: brokered handshakes validate `agentInfo.name === "Kimi Code CLI"` fail-closed, heal once on a reused-foreign broker (compare-and-delete under the broker lock — discard pointer, respawn; never kill the foreign process), and fail loudly on a freshly-spawned foreign agent (both transports validate). Legacy pre-namespace state migrates only from kimi-*-named data dirs, excluding ephemeral broker.json/locks; the hook applies the same basename guard before exporting.
+- Reviews are read-only only when the engine's permission-rejection path is actually used and verified; Codex wrappers must not assume Kimi has a sandbox.
+- ACP is bidirectional. Every agent-to-client request must receive a response or the turn can hang. Unknown requests receive JSON-RPC `-32601`.
+- Existing state uses `KIMI_COMPANION_DATA`, then the legacy `CLAUDE_PLUGIN_DATA` fallback. Codex-specific `PLUGIN_DATA` behavior is deferred until it is implemented and tested.
 
 ## Verification
 
-- `node spike/acp-spike.mjs` must print `SPIKE-GREEN` — proves the live ACP loop (requires `kimi login`; logged-out state fails at `session/new` with `-32000`). Also the regression check after any `kimi` CLI upgrade. (Spike stays at the repo root.)
-- Deterministic suites under `plugin/tests/`, against the scripted fake agent (no login needed), each printing its `*-GREEN` sentinel: `node plugin/tests/acp-client.test.mjs`, `node plugin/tests/kimi.test.mjs`, `node plugin/tests/acp-broker.test.mjs`, `node plugin/tests/kimi-companion.test.mjs`, `node plugin/tests/hooks.test.mjs`, `node plugin/tests/render.test.mjs`, `node plugin/tests/plugin-surface.test.mjs`. The companion/hooks suites drive real CLI/hook child processes and end with their own leak sweeps. Run all seven after any change under `plugin/scripts/` or the hook scripts. After them, the suites' own leak sweeps count only TEST processes (fake agents, and brokers with a test-workspace cwd or the `--agent-spawn` flag) — real installed-plugin brokers on the machine are ignored.
-- Test seam: `KIMI_COMPANION_AGENT_SPAWN` (JSON `{command, args}`) swaps the spawned agent for the scripted fake in every profile resolution; `CLAUDE_PLUGIN_DATA` isolates job/broker state per test workspace — but `KIMI_COMPANION_DATA` outranks it (KMP-23), so every test env builder must `delete env.KIMI_COMPANION_DATA` or isolation silently breaks in a shell where the session hook exported it.
+- Native package surface: `node plugins/kimi/tests/codex-plugin-surface.test.mjs` → `CODEX-PLUGIN-SURFACE-GREEN`.
+- Legacy package consistency: `node plugins/kimi/tests/plugin-surface.test.mjs` → `PLUGIN-SURFACE-TESTS-GREEN`.
+- Deterministic engine suites: `acp-client`, `kimi`, `acp-broker`, `kimi-companion`, `hooks`, and `render` under `plugins/kimi/tests/`; each prints its own `*-GREEN` sentinel.
+- Run all package and engine suites after changes under `plugins/kimi/scripts/` or hook scripts.
+- Live ACP regression: `node spike/acp-spike.mjs` → `SPIKE-GREEN` (requires `kimi login`).
+- Validate the plugin with the plugin-creator validator and every new skill with the skill-creator validator.
+- End compound gates with `&& echo GATE-GREEN || echo GATE-FAILED` and confirm the printed sentinel.
 
-## Child DOX Index
+## Child DOX index
 
-- `.claude-plugin/marketplace.json` (root) — the `imperix` marketplace catalog; lists the `kimi` plugin at `source: "./plugin"` (KMP-15). Held off `main` until KMP-16's review clears.
-- `docs/PLAN.md`, `docs/ROADMAP.md` — see Local Contracts.
-- `spike/acp-spike.mjs` — M1 feasibility spike, verified 2026-07-15 (kimi v1.48.0). Repo root.
-- `README.md`, `LICENSE`, `NOTICE` — public-facing, repo root.
-- `plugin/` — the installable plugin. `plugin/.claude-plugin/plugin.json` manifest; `commands/`, `agents/`, `skills/`, `prompts/`, `hooks/`, `schemas/`, `scripts/` are the shipped surface; `scripts/lib/*.mjs` is the engine (agent-profile, acp-client, kimi, broker, job control). All Kimi-native as of Epic 2/3 — no codex-named files remain.
-- `plugin/tests/` — plain-node assertion suites + `fixtures/fake-acp-agent.mjs` (scenario-driven scripted ACP agent). No test framework by design; each suite prints a `*-GREEN` sentinel. Ships inside the plugin (inert; not referenced by any manifest).
+- `plugins/kimi/.codex-plugin/plugin.json` — advertised Codex components; currently skills only.
+- `plugins/kimi/skills/kimi-setup/` — native setup readiness workflow.
+- `plugins/kimi/scripts/` — Node/ACP engine and broker/job-control implementation.
+- `plugins/kimi/tests/` — plain Node assertion suites and scripted fake ACP agent.
+- `plugins/kimi/commands/`, `agents/`, `.claude-plugin/`, and `hooks/` — Claude migration source material; not Codex-supported merely because it remains in the tree.
+- `.claude-plugin/marketplace.json` and `CLAUDE.md` — legacy compatibility artifacts in the target copy, not the target distribution surface.

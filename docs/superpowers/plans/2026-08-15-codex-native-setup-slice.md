@@ -29,21 +29,21 @@
 - Consumes: the existing `plugin/` runtime tree
 - Produces: a validated plugin named `kimi` at `plugins/kimi`
 
-- [ ] **Step 1: Write the failing package-surface test**
+- [x] **Step 1: Write the failing package-surface test**
 
 Assert the exact marketplace path `./plugins/kimi`, manifest name/version/skills path, and that the manifest does not advertise hooks, MCP servers, or apps.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node plugin/tests/codex-plugin-surface.test.mjs`
 
 Expected: FAIL because `plugins/kimi/.codex-plugin/plugin.json` does not exist.
 
-- [ ] **Step 3: Move the plugin tree and scaffold the Codex manifest**
+- [x] **Step 3: Move the plugin tree and scaffold the Codex manifest**
 
 Run the plugin-creator scaffold against `plugins/kimi`, then replace its generic metadata with repository-specific values.
 
-- [ ] **Step 4: Add the repository marketplace entry**
+- [x] **Step 4: Add the repository marketplace entry**
 
 Create `.agents/plugins/marketplace.json` with marketplace `imperix`, plugin `kimi`, and source `./plugins/kimi`.
 
@@ -58,21 +58,21 @@ Create `.agents/plugins/marketplace.json` with marketplace `imperix`, plugin `ki
 - Consumes: `${PLUGIN_ROOT}/scripts/kimi-companion.mjs setup`
 - Produces: explicit/implicit Codex setup workflow named `kimi-setup`
 
-- [ ] **Step 1: Extend the failing test**
+- [x] **Step 1: Extend the failing test**
 
 Assert the skill has only `name` and `description` frontmatter, uses `${PLUGIN_ROOT}`, calls exactly the `setup` subcommand, and does not mention the deferred task/review/job workflows as supported behavior.
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `node plugins/kimi/tests/codex-plugin-surface.test.mjs`
 
 Expected: FAIL because `skills/kimi-setup/SKILL.md` does not exist.
 
-- [ ] **Step 3: Initialize and write the minimal skill**
+- [x] **Step 3: Initialize and write the minimal skill**
 
 Use the skill-creator initializer, then write imperative setup instructions and matching `agents/openai.yaml` metadata.
 
-- [ ] **Step 4: Run the focused test to verify it passes**
+- [x] **Step 4: Run the focused test to verify it passes**
 
 Run: `node plugins/kimi/tests/codex-plugin-surface.test.mjs`
 
@@ -90,11 +90,11 @@ Expected: `CODEX-PLUGIN-SURFACE-GREEN`.
 - Consumes: verified package and setup behavior
 - Produces: accurate Codex scope and deferred-port ledger
 
-- [ ] **Step 1: Update repository documentation**
+- [x] **Step 1: Update repository documentation**
 
 Describe the Codex target, installation surface, setup-only support, and deferred capabilities.
 
-- [ ] **Step 2: Validate generated artifacts**
+- [x] **Step 2: Validate generated artifacts**
 
 Run the plugin validator, skill validator, migration target validator, focused surface test, all existing deterministic runtime tests, and the real setup probe.
 

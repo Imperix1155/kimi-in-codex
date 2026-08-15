@@ -1,0 +1,24 @@
+{
+  "name": "kimi",
+  "version": "0.1.5",
+  "description": "Check and prepare the Kimi Code CLI for Codex workflows.",
+  "author": {
+    "name": "Imperix1155",
+    "url": "https://github.com/Imperix1155"
+  },
+  "homepage": "https://github.com/Imperix1155/kimi-in-codex#readme",
+  "repository": "https://github.com/Imperix1155/kimi-in-codex",
+  "license": "Apache-2.0",
+  "keywords": ["kimi", "codex", "setup"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Kimi",
+    "shortDescription": "Prepare Kimi Code CLI for Codex.",
+    "longDescription": "Verify that the local Kimi Code CLI is installed, authenticated, and ready. Delegation and review workflows are not included in this initial Codex slice.",
+    "developerName": "Imperix1155",
+    "category": "Productivity",
+    "capabilities": ["Read"],
+    "websiteURL": "https://github.com/Imperix1155/kimi-in-codex",
+    "defaultPrompt": ["Use Kimi Setup to check whether my Kimi Code CLI is ready."]
+  }
+}
