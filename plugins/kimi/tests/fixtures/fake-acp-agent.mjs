@@ -11,6 +11,17 @@ if (process.env.KIMI_FAKE_START_MARKER) {
 }
 
 const scenario = process.argv[2] ?? "basic";
+
+if (scenario === "startup-home-log-denied") {
+  process.stderr.write("PermissionError: [Errno 1] Operation not permitted: '/Users/example/.kimi/logs/kimi.log'\n");
+  process.exit(1);
+}
+
+if (scenario === "startup-long-stderr") {
+  process.stderr.write(`BROKER-LOG-BEGIN:${"x".repeat(20 * 1024)}:BROKER-LOG-END\n`);
+  process.exit(1);
+}
+
 const rl = readline.createInterface({ input: process.stdin });
 let nextAgentRequestId = 1000;
 let sessionCount = 0;

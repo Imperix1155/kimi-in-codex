@@ -7,6 +7,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { AcpClient, BROKER_BUSY_RPC_CODE } from "../scripts/lib/acp-client.mjs";
+import { createBrokerEndpoint, parseBrokerEndpoint } from "../scripts/lib/broker-endpoint.mjs";
 import {
   clearBrokerSessionIfEndpoint,
   ensureBrokerSession,
@@ -18,6 +19,7 @@ import {
 import { newSession, runPromptTurn } from "../scripts/lib/kimi.mjs";
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
+const EXPECTED_BROKER_LOG_TAIL_BYTES = 8 * 1024;
 
 // The whole suite dies loudly rather than hanging a CI-less gate.
 const deadman = setTimeout(() => {
@@ -312,14 +314,23 @@ await withBroker("basic", async (session, cwd) => {
   await client.close();
 }
 
-// 12. Startup-timeout teardown kills the detached broker AND its hung agent.
+// 12. Startup-timeout teardown kills the detached broker AND its hung agent,
+// while preserving the fact that readiness ended by timeout.
 {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
-  const session = await ensureBrokerSession(cwd, {
-    extraBrokerArgs: agentSpawnArgs("hang-init"),
-    timeoutMs: 700
-  });
-  assert.equal(session, null, "a broker whose agent hangs at initialize must not be reported ready");
+  let failure = null;
+  try {
+    await ensureBrokerSession(cwd, {
+      extraBrokerArgs: agentSpawnArgs("hang-init"),
+      timeoutMs: 700
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "a broker whose agent hangs at initialize must fail startup");
+  assert.equal(failure.data?.brokerStartup?.reason, "timeout");
+  assert.equal(failure.data?.brokerStartup?.exitCode, null);
+  assert.equal(failure.data?.brokerStartup?.signal, null);
   const { spawnSync } = await import("node:child_process");
   let leftover = "";
   const cleanupDeadline = Date.now() + 3000;
@@ -334,6 +345,65 @@ await withBroker("basic", async (session, cwd) => {
     await new Promise((resolve) => setTimeout(resolve, 100));
   } while (true);
   assert.equal(leftover, "", `hung broker/agent processes leaked: ${leftover}`);
+}
+
+// 12a. An ACP child that exits during startup must preserve its real exit and
+// stderr evidence before cleanup. This is the fresh Codex task failure shape:
+// Kimi cannot open ~/.kimi/logs/kimi.log inside the default sandbox.
+{
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
+  let failedSessionDir = null;
+  let failure = null;
+  try {
+    await AcpClient.connect(cwd, {
+      useBroker: true,
+      brokerOptions: {
+        extraBrokerArgs: agentSpawnArgs("startup-home-log-denied"),
+        createBrokerEndpoint(sessionDir, platform) {
+          failedSessionDir = sessionDir;
+          return createBrokerEndpoint(sessionDir, platform);
+        }
+      }
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "an ACP child startup failure must reject the broker connect");
+  assert.equal(failure.data?.brokerStartup?.reason, "child-exit");
+  assert.equal(failure.data?.brokerStartup?.exitCode, 1);
+  assert.equal(failure.data?.brokerStartup?.signal, null);
+  assert.match(failure.data?.brokerStartup?.logTail ?? "", /PermissionError.*kimi\.log/s);
+  assert.equal(failure.data?.brokerStartup?.endpointKind, "unix");
+  assert.equal(failure.data?.brokerStartup?.cwd, cwd);
+  assert.match(failure.data?.brokerStartup?.scriptPath ?? "", /acp-broker\.mjs$/);
+  assert.ok(failedSessionDir, "the failed broker session directory must be observed");
+  assert.equal(fs.existsSync(failedSessionDir), false, "failed broker session directory must be removed");
+  assert.equal(fs.existsSync(path.join(failedSessionDir, "broker.pid")), false, "failed broker pid file must be removed");
+  assert.equal(fs.existsSync(path.join(failedSessionDir, "broker.log")), false, "failed broker log file must be removed after capture");
+  assert.equal(fs.existsSync(parseBrokerEndpoint(`unix:${path.join(failedSessionDir, "broker.sock")}`).path), false, "failed broker socket must be removed");
+  assert.equal(loadBrokerSession(cwd), null, "failed broker state must not be recorded");
+}
+
+// 12b. Startup stderr is a bounded tail: diagnostics retain the useful end
+// without allowing an unbounded child log into structured error output.
+{
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-test-"));
+  let failure = null;
+  try {
+    await AcpClient.connect(cwd, {
+      useBroker: true,
+      brokerOptions: { extraBrokerArgs: agentSpawnArgs("startup-long-stderr") }
+    });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure, "oversized ACP startup stderr must reject the broker connect");
+  const evidence = failure.data?.brokerStartup;
+  assert.equal(evidence?.reason, "child-exit");
+  assert.equal(evidence?.logTruncated, true);
+  assert.ok(Buffer.byteLength(evidence?.logTail ?? "", "utf8") <= EXPECTED_BROKER_LOG_TAIL_BYTES);
+  assert.doesNotMatch(evidence?.logTail ?? "", /BROKER-LOG-BEGIN/);
+  assert.match(evidence?.logTail ?? "", /BROKER-LOG-END/);
 }
 
 // 13. Concurrent ensureBrokerSession: exactly one broker survives in state

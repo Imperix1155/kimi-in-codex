@@ -11,7 +11,16 @@ import { resolveStateDir } from "./state.mjs";
 
 export const PID_FILE_ENV = "KIMI_COMPANION_BROKER_PID_FILE";
 export const LOG_FILE_ENV = "KIMI_COMPANION_BROKER_LOG_FILE";
+export const BROKER_LOG_TAIL_BYTES = 8 * 1024;
 const BROKER_STATE_FILE = "broker.json";
+
+export class BrokerStartupError extends Error {
+  constructor(message, brokerStartup) {
+    super(message);
+    this.name = "BrokerStartupError";
+    this.data = { brokerStartup };
+  }
+}
 
 export function createBrokerSessionDir(prefix = "kmc-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -72,6 +81,32 @@ export function spawnBrokerProcess({ scriptPath, cwd, endpoint, pidFile, logFile
   child.unref();
   fs.closeSync(logFd);
   return child;
+}
+
+function waitForChildClose(child) {
+  return new Promise((resolve) => {
+    child.once("close", (exitCode, signal) => resolve({ reason: "child-exit", exitCode, signal }));
+    child.once("error", (error) => resolve({ reason: "child-exit", exitCode: null, signal: null, spawnError: error.message }));
+  });
+}
+
+function readBrokerLogTail(logFile, maxBytes = BROKER_LOG_TAIL_BYTES) {
+  if (!fs.existsSync(logFile)) {
+    return { logTail: "", logTruncated: false };
+  }
+  const size = fs.statSync(logFile).size;
+  const length = Math.min(size, maxBytes);
+  const buffer = Buffer.alloc(length);
+  const descriptor = fs.openSync(logFile, "r");
+  try {
+    fs.readSync(descriptor, buffer, 0, length, size - length);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return {
+    logTail: buffer.toString("utf8"),
+    logTruncated: size > maxBytes
+  };
 }
 
 function resolveBrokerStateFile(cwd) {
@@ -249,8 +284,24 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
     env: options.env ?? process.env
   });
 
-  const ready = await waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000);
-  if (!ready) {
+  const outcome = await Promise.race([
+    waitForBrokerEndpoint(endpoint, options.timeoutMs ?? 2000).then((ready) => ({ reason: ready ? "ready" : "timeout" })),
+    waitForChildClose(child)
+  ]);
+  if (outcome.reason !== "ready") {
+    const exitCode = outcome.exitCode ?? child.exitCode ?? null;
+    const signal = outcome.signal ?? child.signalCode ?? null;
+    const log = readBrokerLogTail(logFile);
+    const brokerStartup = {
+      reason: outcome.reason,
+      exitCode,
+      signal,
+      ...log,
+      scriptPath,
+      cwd,
+      endpointKind: parseBrokerEndpoint(endpoint).kind,
+      ...(outcome.spawnError ? { spawnError: outcome.spawnError } : {})
+    };
     // A broker that never came up (e.g. its agent hung during initialize)
     // must not linger detached and untracked.
     teardownBrokerSession({
@@ -261,7 +312,10 @@ async function startBrokerSessionLocked(cwd, options, killImpl) {
       pid: child.pid ?? null,
       killProcess: killImpl
     });
-    return null;
+    const outcomeLabel = outcome.reason === "child-exit"
+      ? signal ? `child exited with signal ${signal}` : `child exited with code ${exitCode ?? "unknown"}`
+      : "readiness timed out";
+    throw new BrokerStartupError(`Failed to start the shared agent broker (${outcomeLabel}).`, brokerStartup);
   }
 
   const session = {

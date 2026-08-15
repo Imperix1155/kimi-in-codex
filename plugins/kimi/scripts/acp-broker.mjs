@@ -294,6 +294,8 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+  const message = error instanceof Error ? error.message : String(error);
+  const agentStderr = typeof error?.data?.stderr === "string" ? error.data.stderr.trim() : "";
+  process.stderr.write(`${message}${agentStderr ? `\nAgent stderr:\n${agentStderr}` : ""}\n`);
   process.exit(1);
 });
