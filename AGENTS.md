@@ -12,6 +12,7 @@ The current Codex support boundary is deliberately narrow: `kimi-setup` and fore
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md) is the issue tracker (`KMP-##` checkboxes).
 - The native plugin lives at [`plugins/kimi/`](./plugins/kimi), with its manifest at `plugins/kimi/.codex-plugin/plugin.json`.
 - The repository marketplace is [`.agents/plugins/marketplace.json`](./.agents/plugins/marketplace.json).
+- [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) is the public pull-request and `main` CI gate; keep its token read-only and its action revisions immutable.
 - Preserve the proven Node/ACP engine unless a port requirement has a test that demonstrates the needed change.
 - Do not modify a checkout of the separate `Imperix1155/kimi-in-claude-code` source repository.
 
@@ -32,6 +33,7 @@ The current Codex support boundary is deliberately narrow: `kimi-setup` and fore
 - Live ACP regression: `node spike/acp-spike.mjs` → `SPIKE-GREEN` (requires `kimi login`).
 - Validate the plugin with the plugin-creator validator and every new skill with the skill-creator validator.
 - Frozen review live probe: `node plugins/kimi/scripts/kimi-companion.mjs review --diff-file <path> --diff-sha256 <64-hex> --json` must return `REVIEWED` with matching hash/bytes, or explicit `NOT REVIEWED` nonzero.
+- GitHub CI must pass the same eight deterministic suites on the exact pull-request head before merge.
 - End compound gates with `&& echo GATE-GREEN || echo GATE-FAILED` and confirm the printed sentinel.
 
 ## Child DOX index
@@ -43,3 +45,4 @@ The current Codex support boundary is deliberately narrow: `kimi-setup` and fore
 - `plugins/kimi/tests/` — plain Node assertion suites and scripted fake ACP agent.
 - `plugins/kimi/commands/`, `agents/`, `.claude-plugin/`, and `hooks/` — Claude migration source material; not Codex-supported merely because it remains in the tree.
 - `.claude-plugin/marketplace.json` and `CLAUDE.md` — legacy compatibility artifacts in the target copy, not the target distribution surface.
+- `.github/workflows/ci.yml` — read-only GitHub Actions gate for pull requests and `main`.
