@@ -320,12 +320,19 @@ await withBroker("basic", async (session, cwd) => {
     timeoutMs: 700
   });
   assert.equal(session, null, "a broker whose agent hangs at initialize must not be reported ready");
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  const { execSync } = await import("node:child_process");
+  const { spawnSync } = await import("node:child_process");
   let leftover = "";
-  try {
-    leftover = execSync("pgrep -f hang-init || true", { encoding: "utf8" }).trim();
-  } catch {}
+  const cleanupDeadline = Date.now() + 3000;
+  do {
+    const probe = spawnSync("pgrep", ["-f", "hang-init"], { encoding: "utf8" });
+    assert.equal(probe.error, undefined, `could not inspect hung processes: ${probe.error?.message}`);
+    assert.ok(probe.status === 0 || probe.status === 1, `pgrep failed with exit ${probe.status}: ${probe.stderr}`);
+    leftover = probe.status === 0 ? probe.stdout.trim() : "";
+    if (!leftover || Date.now() >= cleanupDeadline) {
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  } while (true);
   assert.equal(leftover, "", `hung broker/agent processes leaked: ${leftover}`);
 }
 
