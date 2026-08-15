@@ -98,10 +98,10 @@ Describe the Codex target, installation surface, setup-only support, and deferre
 
 Run the plugin validator, skill validator, migration target validator, focused surface test, all existing deterministic runtime tests, and the real setup probe.
 
-- [ ] **Step 3: Re-run the secret scan**
+- [x] **Step 3: Re-run the secret scan**
 
 Run gitleaks over all history and the new working tree before public push.
 
-- [ ] **Step 4: Commit and publish**
+- [x] **Step 4: Commit and publish**
 
 Commit the target-only changes, push `main` to `Imperix1155/kimi-in-codex`, and verify remote visibility and HEAD.
