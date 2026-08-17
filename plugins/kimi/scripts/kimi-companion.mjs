@@ -50,6 +50,7 @@ import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { generateJobId, getConfig, listJobs, setConfig, upsertJob, writeJobFile } from "./lib/state.mjs";
 import {
+  attributeTtlExpiry,
   buildSingleJobSnapshot,
   buildStatusSnapshot,
   findActiveWorkspaceJob,
@@ -1409,6 +1410,7 @@ async function handleTaskWorker(argv) {
   const overrides = {};
   const abortController = new AbortController();
   let ttlTimer = null;
+  let ttlExpired = false;
   if (storedJob.codexBackground) {
     assertSealedLaunchAuthority(storedJob);
     overrides.write = storedJob.write;
@@ -1419,7 +1421,10 @@ async function handleTaskWorker(argv) {
     // deadline externally, because a wedged worker will not honor its timer.
     overrides.cancelOnDisconnect = true;
     const remainingMs = Date.parse(storedJob.ttlDeadline ?? "") - Date.now();
-    ttlTimer = setTimeout(() => abortController.abort(), Math.max(0, Number.isFinite(remainingMs) ? remainingMs : 0));
+    ttlTimer = setTimeout(() => {
+      ttlExpired = true;
+      abortController.abort();
+    }, Math.max(0, Number.isFinite(remainingMs) ? remainingMs : 0));
     ttlTimer.unref?.();
   }
 
@@ -1432,6 +1437,9 @@ async function handleTaskWorker(argv) {
   } finally {
     if (ttlTimer) {
       clearTimeout(ttlTimer);
+    }
+    if (ttlExpired) {
+      attributeTtlExpiry(workspaceRoot, storedJob.id);
     }
   }
 }

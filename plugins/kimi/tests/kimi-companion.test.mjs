@@ -1765,6 +1765,61 @@ function listLeakedTestProcesses() {
   assert.equal(outcome.survivorRetained, true, "an ACTIVE job must never be pruned by MAX_JOBS");
 }
 
+// §14 Q2 attribution: a TTL self-abort ends the turn as a graceful cancel,
+// but the record must say the DEADLINE did it, as `failed` — the label may
+// not depend on which enforcer (worker timer vs reconciler) won the race.
+// A record that settled `completed` keeps its result; legacy records are
+// never touched.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const probeScript = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      const jobControl = await import(process.argv[3]);
+      const workspaceRoot = process.argv[1];
+      const seed = (record) => {
+        state.writeJobFile(workspaceRoot, record.id, record);
+        state.upsertJob(workspaceRoot, record);
+      };
+      seed({ id: "task-ttlcancel-aaaaaa", codexBackground: true, status: "cancelled", phase: "cancelled", write: false, workspaceRoot });
+      seed({ id: "task-ttldone0-bbbbbb", codexBackground: true, status: "completed", phase: "done", write: false, workspaceRoot, errorMessage: null });
+      seed({ id: "task-legacy00-cccccc", status: "cancelled", phase: "cancelled", write: false, workspaceRoot, errorMessage: null });
+      const rewrote = jobControl.attributeTtlExpiry(workspaceRoot, "task-ttlcancel-aaaaaa");
+      const keptCompleted = jobControl.attributeTtlExpiry(workspaceRoot, "task-ttldone0-bbbbbb");
+      const keptLegacy = jobControl.attributeTtlExpiry(workspaceRoot, "task-legacy00-cccccc");
+      const byId = (id) => state.listJobs(workspaceRoot).find((job) => job.id === id);
+      process.stdout.write(JSON.stringify({
+        rewrote, keptCompleted, keptLegacy,
+        cancelled: byId("task-ttlcancel-aaaaaa"),
+        completed: byId("task-ttldone0-bbbbbb"),
+        legacy: byId("task-legacy00-cccccc")
+      }));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      probeScript,
+      context.cwd,
+      pathToImport("../scripts/lib/state.mjs"),
+      pathToImport("../scripts/lib/job-control.mjs")
+    ],
+    { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 20_000 }
+  );
+  assert.equal(probe.status, 0, `TTL attribution probe failed: ${probe.stderr}`);
+  const outcome = JSON.parse(probe.stdout);
+  assert.equal(outcome.rewrote, true, "a cancelled background record must be re-attributed to the deadline");
+  assert.equal(outcome.cancelled.status, "failed");
+  assert.match(outcome.cancelled.errorMessage, /deadline exceeded/i);
+  assert.match(outcome.cancelled.errorMessage, /TTL deadline|time budget/i);
+  assert.equal(outcome.keptCompleted, false, "a completed record's result must never be destroyed by TTL attribution");
+  assert.equal(outcome.completed.status, "completed");
+  assert.equal(outcome.completed.errorMessage ?? null, null);
+  assert.equal(outcome.keptLegacy, false, "legacy records are outside the Codex TTL contract");
+  assert.equal(outcome.legacy.status, "cancelled");
+}
+
 // §12 #12/#13 at the runtime level. Cancelling a job whose agent IGNORES
 // session/cancel must never print CANCELLED: the worker is dead and a signal
 // was delivered, but the turn is provably still in flight, so the honest

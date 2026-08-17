@@ -8,7 +8,8 @@ import {
   DEADLINE_EXCEEDED_MESSAGE,
   isPastTtlDeadline,
   LIVENESS_UNCONFIRMED_MESSAGE,
-  REBOOT_LIVENESS_MESSAGE
+  REBOOT_LIVENESS_MESSAGE,
+  TTL_SELF_ABORT_MESSAGE
 } from "./codex-jobs.mjs";
 import { getSessionRuntimeStatus } from "./kimi.mjs";
 import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
@@ -83,6 +84,23 @@ function markCodexJobTerminal(workspaceRoot, job, status, errorMessage) {
   if (stored) {
     writeJobFile(workspaceRoot, job.id, { ...stored, ...patch, id: job.id });
   }
+}
+
+// TTL self-abort attribution (§14 Q2): a worker whose own deadline timer
+// fired ends the turn as a graceful ACP cancel, which runTrackedJob records
+// as `cancelled` — indistinguishable from a user cancellation. The contract
+// says expiry is reported `failed`/deadline-exceeded, and the label must not
+// depend on which enforcer (self-abort vs reconciler) won the race. Only a
+// `cancelled` record is rewritten: a job that beat the timer to `completed`
+// keeps its result (the same never-destroy-a-settled-result rule cancel
+// follows).
+export function attributeTtlExpiry(workspaceRoot, jobId) {
+  const stored = readStoredJob(workspaceRoot, jobId);
+  if (!stored || !stored.codexBackground || stored.status !== "cancelled") {
+    return false;
+  }
+  markCodexJobTerminal(workspaceRoot, stored, "failed", TTL_SELF_ABORT_MESSAGE);
+  return true;
 }
 
 // The reconciler is the EXTERNAL enforcer: a wedged worker will not honor

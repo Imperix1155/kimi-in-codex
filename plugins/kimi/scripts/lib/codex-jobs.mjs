@@ -199,3 +199,5 @@ export const LIVENESS_UNCONFIRMED_MESSAGE = "Worker liveness cannot be confirmed
 export const REBOOT_LIVENESS_MESSAGE =
   "Worker liveness cannot be confirmed: the recorded worker did not survive a reboot boundary. No signal was sent to any process.";
 export const DEADLINE_EXCEEDED_MESSAGE = "Deadline exceeded; worker liveness cannot be confirmed.";
+export const TTL_SELF_ABORT_MESSAGE =
+  "Deadline exceeded: the worker terminated the turn at its sealed TTL deadline. The job did not fail on its own; its time budget ran out.";
