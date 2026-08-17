@@ -72,6 +72,9 @@ assert.match(roadmap, /exact-head full suites/i);
 assert.match(roadmap, /c1f810bfdb4e740cf5e4c7c95d44bf659a57bb61/);
 assert.match(roadmap, /four live Kimi 1\.49 canaries/i);
 assert.match(roadmap, /whole-branch review.*native skill set/i);
+assert.match(roadmap, /Integration verification \(PR #3/);
+assert.match(roadmap, /781c6c309cfbfd3aab599530cd607512d42e42a9/);
+assert.match(roadmap, /skill validators.*exited zero|validators.*exited zero/i);
 
 const skillPath = path.join(pluginRoot, "skills", "kimi-setup", "SKILL.md");
 assert.ok(fs.existsSync(skillPath), "kimi-setup skill must exist");
