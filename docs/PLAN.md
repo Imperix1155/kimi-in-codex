@@ -16,7 +16,7 @@ Native Codex surface:
 
 Deferred until independently implemented and verified: automatic freezing and coverage-ledger orchestration; mutable working-tree/branch review; background and durable task lifecycle, status, result, and cancel workflows remain deferred. Rescue workflows remain deferred. Hooks, Codex data naming, and the MCP wrapper also remain deferred. Claude command/agent/hook files remain migration source material and are not advertised by the Codex manifest.
 
-Final acceptance remains pending: before KMP-30 can close, Phase 5 must explicitly clean stale fake broker/agent processes from worktree `b37c`, then rerun the exact-head full suites, mutation checks, validators, and live canaries. Do not treat this documentation update as verification evidence.
+Phase 5 acceptance completed the stale-process audit, exact-head suites, mutation checks, validators, and live canaries recorded in `docs/ROADMAP.md`. A later whole-branch review correctly found that two legacy Claude helper skills were still discoverable through the packaged `skills/` root; final acceptance therefore also requires the native skill-set and one-shot-copy correction gates recorded there.
 
 ---
 
@@ -64,7 +64,7 @@ kimi-in-codex/                     (independent history copy; NOTICE preserved)
     ├── schemas/review-output.schema.json
     ├── commands/    review.md  task.md  status.md  result.md  cancel.md  setup.md  rescue.md
     ├── agents/      kimi-rescue.md
-    ├── skills/      kimi-setup/  kimi-review/  kimi-task/  kimi-cli-runtime/  kimi-result-handling/
+    ├── skills/      kimi-setup/  kimi-review/  kimi-task/
     ├── prompts/     review.md  stop-review-gate.md
     ├── tests/       *.test.mjs + fixtures/fake-acp-agent.mjs   (plain-node suites)
     └── scripts/

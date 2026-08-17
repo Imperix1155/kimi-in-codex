@@ -185,6 +185,14 @@ function pathToImport(relative) {
   assert.notEqual(concurrent.status, 0);
   assert.match(concurrent.stdout + concurrent.stderr, /busy with another turn/);
 
+  const oneShotConcurrent = runCli(["task", "--codex-once", "--json", "second one-shot"], { env, cwd });
+  assert.notEqual(oneShotConcurrent.status, 0);
+  const oneShotBusy = JSON.parse(oneShotConcurrent.stdout);
+  assert.equal(oneShotBusy.taskStatus, "FAILED");
+  assert.match(oneShotBusy.error, /foreground one-shot/i);
+  assert.match(oneShotBusy.error, /no durable (?:status|lifecycle|job)/i);
+  assert.doesNotMatch(oneShotBusy.error, /\/kimi:status|\/kimi:cancel|job-id/i);
+
   const completed = await pollUntil(() => {
     const status = runCli(["status", jobId, "--json"], { env, cwd });
     const snapshot = status.status === 0 ? JSON.parse(status.stdout) : null;
@@ -281,6 +289,27 @@ function pathToImport(relative) {
   const setup = runCli(["setup"], { env, cwd });
   assert.equal(setup.status, 0, "bare setup now runs the probes");
   assert.match(setup.stdout, /# Kimi Setup/);
+
+  const help = runCli(["help"], { env, cwd });
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /kimi-companion\.mjs setup \[--json\]/);
+  assert.doesNotMatch(help.stdout, /Not yet available|KMP-12/);
+
+  const unavailableEnv = { ...env, PATH: "/usr/bin:/bin" };
+  delete unavailableEnv.KIMI_COMPANION_AGENT_SPAWN;
+  const unavailable = runCli(["task", "--codex-once", "--json", "x"], { env: unavailableEnv, cwd });
+  assert.notEqual(unavailable.status, 0);
+  const unavailablePayload = JSON.parse(unavailable.stdout);
+  assert.equal(unavailablePayload.taskStatus, "FAILED");
+  assert.match(unavailablePayload.error, /\$kimi-setup/);
+  assert.doesNotMatch(unavailablePayload.error, /\/kimi:setup|\/kimi:status|\/kimi:cancel/);
+
+  const emptyOneShot = runCli(["task", "--codex-once", "--json"], { env, cwd });
+  assert.notEqual(emptyOneShot.status, 0);
+  const emptyOneShotPayload = JSON.parse(emptyOneShot.stdout);
+  assert.equal(emptyOneShotPayload.taskStatus, "FAILED");
+  assert.match(emptyOneShotPayload.error, /prompt.*--resume-session/i);
+  assert.doesNotMatch(emptyOneShotPayload.error, /resume-last/);
 }
 
 // 6b. --model alias resolves to the wire id and reaches the agent via

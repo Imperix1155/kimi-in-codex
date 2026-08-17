@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
-// Companion CLI: the plugin's slash commands shell out to this. Adapted from
-// codex-companion.mjs; task/status/result/cancel are live (KMP-7), while
-// setup (KMP-12) and review (KMP-8) land with their own work items.
+// Companion CLI: the plugin's native skills and retained legacy commands shell
+// out to this shared ACP runtime.
 
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
@@ -86,14 +85,14 @@ function printUsage() {
       "  node <plugin-root>/scripts/kimi-companion.mjs review --diff-file <path> --diff-sha256 <64-hex> [--wait] [--model <id|highspeed|k3>] [focus text]",
       "  node <plugin-root>/scripts/kimi-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <id|highspeed|k3>] [focus text]  # legacy live-Git mode",
       "  node <plugin-root>/scripts/kimi-companion.mjs task --codex-once --json [--write|--read-only] [--fresh|--resume-session <id>] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
+      "  node <plugin-root>/scripts/kimi-companion.mjs setup [--json]",
       "  node <plugin-root>/scripts/kimi-companion.mjs task [--background] [--write|--read-only] [--resume-last|--resume|--fresh] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
       "  node <plugin-root>/scripts/kimi-companion.mjs status [job-id] [--all] [--wait] [--json]",
       "  node <plugin-root>/scripts/kimi-companion.mjs result [job-id] [--json]",
       "  node <plugin-root>/scripts/kimi-companion.mjs cancel [job-id] [--json]",
       "",
       "A single quoted prompt argument is re-tokenized (slash-command calling",
-      "convention); pass exact text via --prompt-file or piped stdin.",
-      "Not yet available: setup (KMP-12)."
+      "convention); pass exact text via --prompt-file or piped stdin."
     ].join("\n")
   );
 }
@@ -162,10 +161,11 @@ function firstMeaningfulLine(text, fallback) {
   return line ?? fallback;
 }
 
-function ensureKimiAvailable(cwd) {
+function ensureKimiAvailable(cwd, { codexOnce = false } = {}) {
   const availability = getKimiAvailability(cwd);
   if (!availability.available) {
-    throw new Error("Kimi Code CLI is not installed or not on PATH. Install it (https://github.com/MoonshotAI/kimi-code), then rerun /kimi:setup.");
+    const setupCommand = codexOnce ? "$kimi-setup" : "/kimi:setup";
+    throw new Error(`Kimi Code CLI is not installed or not on PATH. Install it (https://github.com/MoonshotAI/kimi-code), then rerun ${setupCommand}.`);
   }
 }
 
@@ -519,7 +519,7 @@ async function handleReview(argv) {
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
-  ensureKimiAvailable(request.cwd);
+  ensureKimiAvailable(request.cwd, { codexOnce: Boolean(request.codexOnce) });
 
   // Resolved at ENQUEUE time (handleTask) and carried in the request: a
   // delayed background worker resolving "latest" at execution time could
@@ -560,6 +560,9 @@ async function executeTaskRun(request) {
     });
   } catch (error) {
     if (isBrokerBusyError(error)) {
+      if (request.codexOnce) {
+        throw new Error("The shared Kimi runtime is busy with another turn. This foreground one-shot has no durable status or cancel API; wait for the active turn to finish or interrupt its owning foreground invocation.");
+      }
       throw new Error("The shared Kimi runtime is busy with another turn. Check /kimi:status, wait for it to finish, or /kimi:cancel <job-id> to stop it.");
     }
     throw error;
@@ -809,7 +812,9 @@ async function handleTask(argv) {
   // wins so a caller can never be surprised into a write-enabled run.
   const write = Boolean(options.write) && !options["read-only"];
   if (!prompt && !resumeLast && !resumeSessionId) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
+    throw new Error(codexOnce
+      ? "Provide a prompt, a prompt file, piped stdin, or --resume-session <exact-session-id>."
+      : "Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
   if (codexOnce) {
@@ -820,6 +825,7 @@ async function handleTask(argv) {
       model,
       resumeLast: Boolean(resumeSessionId),
       resumeSessionId,
+      codexOnce: true,
       preservePromptWhitespace: true
     });
     return;

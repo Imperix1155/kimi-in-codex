@@ -20,6 +20,29 @@ for (const unsupported of ["hooks", "mcpServers", "apps"]) {
   assert.ok(!(unsupported in manifest), `setup slice must not advertise ${unsupported}`);
 }
 
+const nativeSkillsRoot = path.join(pluginRoot, "skills");
+const packagedNativeSkills = fs.readdirSync(nativeSkillsRoot, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+  .map((entry) => entry.name)
+  .sort();
+assert.deepEqual(
+  packagedNativeSkills,
+  ["kimi-review", "kimi-setup", "kimi-task"],
+  "Codex discovery must expose exactly the approved native skill set"
+);
+const packagedNativeSkillText = packagedNativeSkills
+  .map((name) => fs.readFileSync(path.join(nativeSkillsRoot, name, "SKILL.md"), "utf8"))
+  .join("\n");
+for (const legacyGuidance of [
+  /CLAUDE_PLUGIN_ROOT/,
+  /\/kimi:/,
+  /--resume-last/,
+  /default to a write-capable/i,
+  /(?:add|pass).*--background/i
+]) {
+  assert.doesNotMatch(packagedNativeSkillText, legacyGuidance);
+}
+
 const marketplace = readJson(path.join(repoRoot, ".agents", "plugins", "marketplace.json"));
 assert.equal(marketplace.name, "imperix");
 assert.equal(marketplace.plugins.length, 1);
@@ -48,6 +71,7 @@ assert.match(roadmap, /stale fake broker\/agent processes.*b37c/i);
 assert.match(roadmap, /exact-head full suites/i);
 assert.match(roadmap, /c1f810bfdb4e740cf5e4c7c95d44bf659a57bb61/);
 assert.match(roadmap, /four live Kimi 1\.49 canaries/i);
+assert.match(roadmap, /whole-branch review.*native skill set/i);
 
 const skillPath = path.join(pluginRoot, "skills", "kimi-setup", "SKILL.md");
 assert.ok(fs.existsSync(skillPath), "kimi-setup skill must exist");
