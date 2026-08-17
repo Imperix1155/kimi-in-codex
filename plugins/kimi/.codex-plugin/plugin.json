@@ -1,7 +1,7 @@
 {
   "name": "kimi",
-  "version": "0.1.5",
-  "description": "Check Kimi readiness, review verified frozen diffs, and run a foreground task handoff from Codex.",
+  "version": "0.1.6",
+  "description": "Check Kimi readiness, review verified frozen diffs, run a foreground task handoff, and observe or stop one read-only background job from Codex.",
   "author": {
     "name": "Imperix1155",
     "url": "https://github.com/Imperix1155"
@@ -13,12 +13,12 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "Kimi",
-    "shortDescription": "Prepare Kimi, review frozen diffs, or hand off one foreground task.",
-    "longDescription": "Verify local Kimi readiness, run foreground adversarial reviews against a frozen saved diff whose SHA-256 is verified before Kimi starts, and hand off one foreground task with explicit access controls. Background and durable lifecycle APIs are not included.",
+    "shortDescription": "Prepare Kimi, review frozen diffs, hand off a task, or check a background job.",
+    "longDescription": "Verify local Kimi readiness, run foreground adversarial reviews against a frozen saved diff whose SHA-256 is verified before Kimi starts, and hand off one task with explicit access controls. Background execution is deliberately bounded: one read-only job at a time per workspace, TTL-bounded at 30 minutes by default and never more than 60, addressed by exact job ID only, with results and session IDs released only to the claim token returned at launch. Cancellation reports a terminal cancelled state only when it is confirmed.",
     "developerName": "Imperix1155",
     "category": "Productivity",
     "capabilities": ["Read", "Write"],
     "websiteURL": "https://github.com/Imperix1155/kimi-in-codex",
-    "defaultPrompt": ["Use Kimi Setup to check readiness, Kimi Review to review a verified frozen diff, or Kimi Task for one foreground task handoff."]
+    "defaultPrompt": ["Use Kimi Setup to check readiness, Kimi Review to review a verified frozen diff, Kimi Task for a task handoff, or Kimi Job to check or stop a background job."]
   }
 }

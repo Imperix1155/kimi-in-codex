@@ -1,11 +1,13 @@
 ---
 name: kimi-task
-description: Use when a user wants to hand one bounded foreground task to Kimi, with read-only access by default or explicitly approved write access.
+description: Use when a user wants to hand one bounded task to Kimi — foreground by default, or as one read-only detached job that keeps running after this call returns.
 ---
 
 # Kimi Task
 
-Hand one foreground task to Kimi and return its terminal result. The default is read-only.
+Hand one task to Kimi. The default is a foreground call that returns Kimi's
+terminal result, read-only. A detached read-only job is available when the user
+explicitly wants work to continue after this call returns.
 
 ## Workflow
 
@@ -53,11 +55,50 @@ Hand one foreground task to Kimi and return its terminal result. The default is 
    - For `CANCELLED`, report that the foreground call was cancelled and include the returned session ID when present.
    - For `FAILED`, report the runtime error and any returned permission evidence; do not present partial output as completion.
 
+## Detached read-only job
+
+Use this only when the user explicitly wants the work to continue after this
+call returns. Everything in steps 1 and 3-5 still applies.
+
+- The job is **read-only, always**. `--write` is refused for a detached job.
+  When the user wants Kimi to edit files, run the foreground call instead;
+  write delegation stays foreground-only, where the user supervises it.
+- **One at a time per workspace.** A launch is refused, naming the blocking
+  job, while another Kimi job is queued, running, or awaiting cancellation.
+- **Exact IDs only.** The launch prints a `jobId` and, once, a `claimToken`.
+  Observing or stopping the job afterwards is `$kimi-job`, and only `$kimi-job`.
+  Preserve both values in your reply; the token is never shown again and cannot
+  be recovered from the job record.
+- **The prompt text and the result are written to disk** in the plugin's state
+  directory and stay there until the job record is removed.
+- `--ttl-minutes` may only lower the 30-minute default; the runtime's hard
+  ceiling is 60 minutes. At the deadline the job is terminated and reported
+  `failed`, never silently extended and never auto-resumed.
+
+Run exactly one foreground invocation with the Codex shell tool:
+
+- `sandbox_permissions: "require_escalated"`
+- `justification: "Allow the authenticated local Kimi runtime to start a detached read-only job that KEEPS RUNNING after this call returns, for up to 30 minutes and never more than 60 minutes? It runs with normal user filesystem authority (not an OS sandbox), so it can read anything you can read for that whole window without further prompts. ACP will reject mutation and shell/execute requests; the job is sealed read-only and cannot be given write authority later. Its prompt text and result are stored on disk until the job record is removed."`
+
+```bash
+TTL_ARGS=()
+if [[ -n "${TTL_MINUTES:-}" ]]; then
+  TTL_ARGS=(--ttl-minutes "${TTL_MINUTES}")
+fi
+JOB_ARGS=(task --codex-background --json --prompt-file "${PROMPT_FILE}" --read-only "${TTL_ARGS[@]}" "${MODEL_ARGS[@]}")
+node "${PLUGIN_ROOT}/scripts/kimi-companion.mjs" "${JOB_ARGS[@]}"
+```
+
+Parse the JSON envelope. `launchStatus` is `QUEUED` on success and `REFUSED`
+otherwise; report a refusal's reason as-is rather than retrying or falling back
+to a foreground call without saying so.
+
 ## Scope and safety
 
-- This skill runs one foreground task only. Background execution is not supported.
-- Do not use durable status, result, or cancel workflows; this call owns only its current terminal result.
+- A foreground call owns only its own terminal result. A detached job is
+  observed and stopped exclusively through `$kimi-job`.
 - Do not invoke rescue behavior, retry a denied/failed elevation, or modify repository content while preparing the prompt file.
+- Do not launch a detached job to work around a busy runtime or a refused write.
 
 ## Common mistakes
 
@@ -67,3 +108,5 @@ Hand one foreground task to Kimi and return its terminal result. The default is 
 | Treating read-only as an OS sandbox | Report the ACP reject-policy boundary accurately. |
 | Resuming the latest historical session | Require the exact session ID from the current conversation. |
 | Passing task text as a shell argument | Use the temporary UTF-8 prompt file so boundary whitespace survives. |
+| Detaching a job the user only asked to run | Detach only on explicit intent; the consent text differs. |
+| Dropping the claim token from your reply | It is shown once; without it the job's content is unrecoverable. |
