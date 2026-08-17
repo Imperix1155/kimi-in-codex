@@ -510,6 +510,108 @@ function pathToImport(relative) {
   shutdownBroker(env, cwd);
 }
 
+// 7i. One-shot process interruption is graceful and confirmed by ACP: both
+// supported signals return a CANCELLED JSON result, stop the fake delayed
+// write before it reaches normal completion, and release the broker for the
+// next foreground task.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  const { cwd, env: baseEnv } = makeWorkspace("cancel-write-delay");
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-one-shot-cancel-"));
+  const promptMarker = path.join(markerDir, "prompt-active.txt");
+  const cancelMarker = path.join(markerDir, "cancel-received.txt");
+  const postCancelMarker = path.join(markerDir, "post-cancel-write.txt");
+  const env = {
+    ...baseEnv,
+    KIMI_FAKE_PROMPT_MARKER: promptMarker,
+    KIMI_FAKE_CANCEL_MARKER: cancelMarker,
+    KIMI_FAKE_POST_CANCEL_MARKER: postCancelMarker
+  };
+  const child = spawn(process.execPath, [
+    CLI, "task", "--codex-once", "--write", "--json", `interrupt with ${signal}`
+  ], { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitPromise = new Promise((resolve) => {
+    child.on("exit", (code, exitSignal) => resolve({ code, signal: exitSignal }));
+  });
+
+  const promptActive = await pollUntil(() => fs.existsSync(promptMarker), 5000, 25);
+  assert.ok(promptActive, `${signal} fixture never reached its active prompt`);
+  assert.equal(child.kill(signal), true, `${signal} was not delivered to the one-shot process`);
+  const exited = await Promise.race([
+    exitPromise,
+    new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+  ]);
+  if (!exited) {
+    child.kill("SIGKILL");
+  }
+  assert.ok(exited, `${signal} one-shot process did not exit inside the deadline`);
+  assert.notEqual(exited.code, 0, `${signal} cancellation must exit nonzero; stdout: ${stdout}; stderr: ${stderr}`);
+
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.deepEqual(
+    { cancelReceived: fs.existsSync(cancelMarker), postCancelWrite: fs.existsSync(postCancelMarker) },
+    { cancelReceived: true, postCancelWrite: false },
+    `${signal} must reach ACP cancellation and prevent delayed post-cancel work`
+  );
+  const payload = JSON.parse(stdout);
+  assert.equal(payload.taskStatus, "CANCELLED", `${signal} stdout: ${stdout}\nstderr: ${stderr}`);
+  assert.equal(payload.stopReason, "cancelled");
+
+  const next = runCli(["task", "--codex-once", "--json", "next task after cancellation"], { env, cwd });
+  assert.equal(next.status, 0, `${signal} left the broker busy: ${next.stderr}`);
+  assert.equal(JSON.parse(next.stdout).taskStatus, "COMPLETED");
+  shutdownBroker(env, cwd);
+}
+
+// 7j. A non-cooperative agent cannot hold the one-shot CLI open forever.
+// The signal still reaches ACP, but without a cancelled stopReason the
+// terminal result is FAILED with explicit unconfirmed-cancellation evidence.
+{
+  const { cwd, env: baseEnv } = makeWorkspace("cancel-unconfirmed");
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-one-shot-unconfirmed-"));
+  const promptMarker = path.join(markerDir, "prompt-active.txt");
+  const cancelMarker = path.join(markerDir, "cancel-received.txt");
+  const env = {
+    ...baseEnv,
+    KIMI_FAKE_PROMPT_MARKER: promptMarker,
+    KIMI_FAKE_CANCEL_MARKER: cancelMarker
+  };
+  const child = spawn(process.execPath, [
+    CLI, "task", "--codex-once", "--json", "ignore this cancellation"
+  ], { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitPromise = new Promise((resolve) => {
+    child.on("exit", (code, exitSignal) => resolve({ code, signal: exitSignal }));
+  });
+
+  assert.ok(await pollUntil(() => fs.existsSync(promptMarker), 5000, 25), "unconfirmed fixture never reached its active prompt");
+  assert.equal(child.kill("SIGINT"), true);
+  const exited = await Promise.race([
+    exitPromise,
+    new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+  ]);
+  if (!exited) {
+    child.kill("SIGKILL");
+  }
+  assert.ok(exited, "unconfirmed cancellation did not exit inside the bounded deadline");
+  assert.notEqual(exited.code, 0);
+  assert.ok(await pollUntil(() => fs.existsSync(cancelMarker), 1000, 25), "unconfirmed cancellation never reached ACP");
+  const payload = JSON.parse(stdout);
+  assert.equal(payload.taskStatus, "FAILED", `stdout: ${stdout}\nstderr: ${stderr}`);
+  assert.match(payload.error, /cancellation unconfirmed/i);
+  shutdownBroker(env, cwd);
+}
+
 // 8. Externally killed worker: status must reconcile the record to failed
 // instead of reporting "running" forever, and cancel must then refuse.
 {

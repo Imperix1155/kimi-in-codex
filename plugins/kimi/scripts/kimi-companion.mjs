@@ -554,6 +554,8 @@ async function executeTaskRun(request) {
       model: request.model ?? null,
       resumeSessionId,
       preservePromptWhitespace: Boolean(request.preservePromptWhitespace),
+      signal: request.signal,
+      cancelOnDisconnect: Boolean(request.cancelOnDisconnect),
       onProgress: request.onProgress
     });
   } catch (error) {
@@ -680,16 +682,30 @@ function classifyTaskExecution(execution) {
 
 async function runCodexOneShotTask(request) {
   const progress = createProgressReporter({ stderr: true });
-  const execution = await executeTaskRun({ ...request, onProgress: progress });
-  const payload = {
-    taskStatus: classifyTaskExecution(execution),
-    ...execution.payload
-  };
-  outputResult(payload, true);
-  if (execution.exitStatus !== 0) {
-    process.exitCode = execution.exitStatus;
+  const abortController = new AbortController();
+  const abort = () => abortController.abort();
+  process.once("SIGINT", abort);
+  process.once("SIGTERM", abort);
+  try {
+    const execution = await executeTaskRun({
+      ...request,
+      signal: abortController.signal,
+      cancelOnDisconnect: true,
+      onProgress: progress
+    });
+    const payload = {
+      taskStatus: classifyTaskExecution(execution),
+      ...execution.payload
+    };
+    outputResult(payload, true);
+    if (execution.exitStatus !== 0) {
+      process.exitCode = execution.exitStatus;
+    }
+    return execution;
+  } finally {
+    process.off("SIGINT", abort);
+    process.off("SIGTERM", abort);
   }
-  return execution;
 }
 
 function spawnDetachedTaskWorker(cwd, jobId) {

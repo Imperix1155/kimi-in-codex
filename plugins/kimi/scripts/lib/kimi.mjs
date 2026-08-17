@@ -301,8 +301,12 @@ export async function newSession(client, cwd, options = {}) {
     cwd,
     mcpServers: options.mcpServers ?? []
   });
-  if (options.permissionDecision) {
-    await client.setSessionPermissionDecision(session.sessionId, options.permissionDecision);
+  if (options.permissionDecision || options.cancelOnDisconnect) {
+    await client.setSessionPermissionDecision(
+      session.sessionId,
+      options.permissionDecision ?? "reject",
+      { cancelOnDisconnect: Boolean(options.cancelOnDisconnect) }
+    );
   }
   return session;
 }
@@ -390,6 +394,7 @@ export function isBrokerBusyError(error) {
 // Every setup probe is bounded: a wedged agent must never hang /kimi:setup
 // (env knob exists for tests and slow machines).
 const SETUP_PROBE_TIMEOUT_MS = Number(process.env.KIMI_COMPANION_PROBE_TIMEOUT_MS) || 20_000;
+const CANCELLATION_CONFIRM_TIMEOUT_MS = 2000;
 
 function withProbeDeadline(promise, label) {
   let timer;
@@ -631,12 +636,17 @@ export async function runKimiTurn(cwd, options = {}) {
         rethrowWithLoginHint(profile, error);
       }
       sessionId = options.resumeSessionId;
-      await client.setSessionPermissionDecision(sessionId, decision);
+      await client.setSessionPermissionDecision(sessionId, decision, {
+        cancelOnDisconnect: Boolean(options.cancelOnDisconnect)
+      });
     } else {
       emitProgress(options.onProgress, "Starting Kimi session.", "starting");
       let session;
       try {
-        session = await newSession(client, sessionCwd, { permissionDecision: decision });
+        session = await newSession(client, sessionCwd, {
+          permissionDecision: decision,
+          cancelOnDisconnect: Boolean(options.cancelOnDisconnect)
+        });
       } catch (error) {
         rethrowWithLoginHint(profile, error);
       }
@@ -644,6 +654,24 @@ export async function runKimiTurn(cwd, options = {}) {
     }
 
     emitProgress(options.onProgress, `Session ready (${sessionId}).`, "starting", { threadId: sessionId });
+
+    let cancellationTimer = null;
+    let cancellationTimedOut = false;
+    const abortHandler = () => {
+      client.notify("session/cancel", { sessionId });
+      if (!cancellationTimer) {
+        cancellationTimer = setTimeout(() => {
+          cancellationTimedOut = true;
+          void client.close().catch(() => {});
+        }, CANCELLATION_CONFIRM_TIMEOUT_MS);
+      }
+    };
+    options.signal?.addEventListener("abort", abortHandler, { once: true });
+    if (options.signal?.aborted) {
+      abortHandler();
+    }
+
+    try {
 
     // Model selection is per session via session/set_model with an exact
     // wire id (verified live 2026-07-17). No flag -> the agent's default.
@@ -698,7 +726,27 @@ export async function runKimiTurn(cwd, options = {}) {
       };
     }
 
-    return { ...result, sessionId, stderr: client.stderr ?? "", permissionEvents };
+      if (options.signal?.aborted && result.stopReason !== "cancelled") {
+        throw new Error(`Cancellation unconfirmed: Kimi stopped with ${result.stopReason ?? "no stop reason"}.`);
+      }
+      return { ...result, sessionId, stderr: client.stderr ?? "", permissionEvents };
+    } catch (error) {
+      if (options.signal?.aborted) {
+        if (/^Cancellation unconfirmed:/i.test(String(error?.message ?? ""))) {
+          throw error;
+        }
+        const detail = cancellationTimedOut
+          ? `Kimi did not confirm cancellation within ${CANCELLATION_CONFIRM_TIMEOUT_MS}ms.`
+          : (error instanceof Error ? error.message : String(error));
+        throw new Error(`Cancellation unconfirmed: ${detail}`);
+      }
+      throw error;
+    } finally {
+      if (cancellationTimer) {
+        clearTimeout(cancellationTimer);
+      }
+      options.signal?.removeEventListener("abort", abortHandler);
+    }
   }, clientOptions);
 }
 
