@@ -114,6 +114,12 @@ rl.on("line", (line) => {
 
   if (message.method === "session/load") {
     observed.wasLoaded = true;
+    if (scenario === "hang-session-load") {
+      if (process.env.KIMI_SESSION_LOAD_MARKER) {
+        fs.writeFileSync(process.env.KIMI_SESSION_LOAD_MARKER, `${message.params?.sessionId ?? ""}\n`, "utf8");
+      }
+      return;
+    }
     send({ id: message.id, result: {} });
     return;
   }

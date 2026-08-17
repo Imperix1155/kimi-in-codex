@@ -612,6 +612,75 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   shutdownBroker(env, cwd);
 }
 
+// 7k. Signal acceptance is bounded even before a session is ready. A hung
+// session/new or session/load must return structured FAILED evidence rather
+// than swallowing SIGINT forever, and the unresolved broker request must
+// remain truthfully busy rather than being cleared without agent confirmation.
+for (const testCase of [
+  {
+    label: "session/new",
+    scenario: "hang-session",
+    markerEnv: "KIMI_SESSION_CWD_MARKER",
+    args: ["task", "--codex-once", "--json", "hang while creating a session"]
+  },
+  {
+    label: "session/load",
+    scenario: "hang-session-load",
+    markerEnv: "KIMI_SESSION_LOAD_MARKER",
+    args: ["task", "--codex-once", "--resume-session", "sess-existing", "--json"]
+  }
+]) {
+  const { cwd, env: baseEnv } = makeWorkspace(testCase.scenario);
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-pre-session-cancel-"));
+  const requestMarker = path.join(markerDir, "request-active.txt");
+  const env = { ...baseEnv, [testCase.markerEnv]: requestMarker };
+  const child = spawn(process.execPath, [CLI, ...testCase.args], {
+    env,
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitPromise = new Promise((resolve) => {
+    child.on("exit", (code, exitSignal) => resolve({ code, signal: exitSignal }));
+  });
+
+  try {
+    assert.ok(
+      await pollUntil(() => fs.existsSync(requestMarker), 5000, 25),
+      `${testCase.label} fixture never reached its hanging request`
+    );
+    assert.equal(child.kill("SIGINT"), true, `${testCase.label} did not accept SIGINT`);
+    const exited = await Promise.race([
+      exitPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+    ]);
+    if (!exited) {
+      child.kill("SIGKILL");
+    }
+    assert.ok(exited, `${testCase.label} interruption was not bounded`);
+    assert.notEqual(exited.code, 0, `${testCase.label} interruption must exit nonzero`);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.taskStatus, "FAILED", `${testCase.label} stdout: ${stdout}\nstderr: ${stderr}`);
+    assert.match(payload.error, /cancellation unconfirmed/i);
+
+    const next = runCli(["task", "--codex-once", "--json", "probe broker truth"], { env, cwd });
+    assert.notEqual(next.status, 0, `${testCase.label} falsely released an unresolved broker request`);
+    const nextPayload = JSON.parse(next.stdout);
+    assert.equal(nextPayload.taskStatus, "FAILED");
+    assert.match(nextPayload.error, /busy with another turn/i);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    shutdownBroker(env, cwd);
+  }
+}
+
 // 8. Externally killed worker: status must reconcile the record to failed
 // instead of reporting "running" forever, and cancel must then refuse.
 {
