@@ -1804,6 +1804,64 @@ function listLeakedTestProcesses() {
   shutdownBroker(context.env, context.cwd);
 }
 
+// Invariant C, the other direction: a cancel must never RELABEL a job that
+// finished on its own. The worker completes normally inside the confirmation
+// window, so "the session is gone" is true but is evidence of completion, not
+// of cancellation. Reproduced with a worker the cancel cannot signal (no
+// recorded pid), so the turn really does run to its own end.
+{
+  const context = makeBackgroundWorkspace("slow-prompt-3s");
+  const launch = launchBackground(["a turn that finishes on its own"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId, claimToken } = launch.payload;
+  const running = await pollCodexJobStatus(jobId, ["running"], context, 15_000);
+  assert.ok(running, "job never reached running");
+
+  const record = readCodexJobFile(jobId, context);
+  writeCodexJobFile(jobId, { ...record, status: "running", phase: "running", pid: null }, context);
+
+  const cancel = runCli(["cancel", "--codex-job", jobId, "--json"], context);
+  const payload = JSON.parse(cancel.stdout);
+  assert.notEqual(
+    payload.cancelStatus,
+    "CANCELLED",
+    `a job that completed on its own must not be relabelled cancelled: ${cancel.stdout}`
+  );
+  assert.equal(payload.status, "completed");
+
+  const after = codexStatus(jobId, context);
+  assert.equal(after.payload.job.status, "completed", "the finished job's recorded state must survive the cancel");
+  const result = runCli(["result", "--codex-job", jobId, "--claim", claimToken, "--json"], context);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(JSON.parse(result.stdout).result.rawOutput, /slow done/, "the user's result must not be destroyed");
+  shutdownBroker(context.env, context.cwd);
+}
+
+// §12 #5, third selector. task-resume-candidate and --resume-last scan the
+// workspace's job history, and their session filter fails OPEN when no
+// KIMI_COMPANION_SESSION_ID is exported — which is always the Codex case. A
+// background record must be invisible to both, or the token-gated sessionId
+// leaks through the legacy surface and resume-by-history comes back.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const launch = launchBackground(["seed a resumable-looking record"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const completed = await pollCodexJobStatus(launch.payload.jobId, ["completed"], context);
+  assert.ok(completed, "seed job never completed");
+
+  const candidate = runCli(["task-resume-candidate", "--json"], context);
+  assert.equal(candidate.status, 0, candidate.stderr);
+  const payload = JSON.parse(candidate.stdout);
+  assert.equal(payload.available, false, "a Codex background job must never be offered as a resume candidate");
+  assert.equal(payload.candidate, null);
+  assert.equal(candidate.stdout.includes("sess-1"), false, "the ACP session id must not leak through the legacy surface");
+
+  const resumeLast = runCli(["task", "--resume-last"], context);
+  assert.notEqual(resumeLast.status, 0, "--resume-last must not reach a Codex background session");
+  assert.match(resumeLast.stderr, /No previous Kimi task session/);
+  shutdownBroker(context.env, context.cwd);
+}
+
 // §12 fixture #3. Broker/agent death mid-turn is VERIFIED, not assumed: the
 // worker's pending session/prompt rejects and the job is recorded failed.
 {

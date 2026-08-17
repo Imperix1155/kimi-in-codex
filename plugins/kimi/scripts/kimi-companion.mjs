@@ -220,6 +220,14 @@ function findLatestResumableTaskJob(jobs) {
     jobs.find(
       (job) =>
         job.jobClass === "task" &&
+        // KMP-32: a Codex background record is NEVER a resume candidate. This
+        // path's session filter fails open with no KIMI_COMPANION_SESSION_ID,
+        // which is always the Codex case — so without this clause
+        // `task-resume-candidate` and `--resume-last` would hand out a
+        // background job's ACP sessionId with no claim token, reconstructing
+        // resume-by-history through the legacy surface. Legacy Claude records
+        // never carry the field, so their behavior is unchanged.
+        !job.codexBackground &&
         job.threadId &&
         job.status !== "queued" &&
         job.status !== "running"
@@ -1135,6 +1143,42 @@ async function runCodexJobCancel(options) {
   }
 
   const completedAt = nowIso();
+
+  // Invariant C cuts both ways. The job may have SETTLED ON ITS OWN inside
+  // the confirmation window — in which case "the session is gone" is
+  // evidence of completion, not of cancellation. Writing `cancelled` here
+  // would destroy the user's recorded result and mislabel the turn, the
+  // same mislabeling class runTrackedJob guards in the other direction.
+  const settled = readStoredJob(workspaceRoot, jobId) ?? {};
+  if (settled.status === "cancelled") {
+    outputResult(
+      {
+        cancelStatus: "CANCELLED",
+        jobId,
+        status: "cancelled",
+        confirmed: true,
+        detail: "Cancellation confirmed: the worker recorded a cancelled stop reason.",
+        residualRisk: null
+      },
+      true
+    );
+    return;
+  }
+  if (settled.status && !isActiveCodexStatus(settled.status)) {
+    outputResult(
+      {
+        cancelStatus: "NOT ACTIVE",
+        jobId,
+        status: settled.status,
+        confirmed: false,
+        detail: `Job ${jobId} reached ${settled.status} on its own before the cancellation took effect; its recorded result was left intact.`,
+        residualRisk: null
+      },
+      true
+    );
+    return;
+  }
+
   if (confirmedBy) {
     appendLogLine(job.logFile, `Cancellation confirmed: ${confirmedBy}.`);
     writeCodexJobPatch(workspaceRoot, jobId, {
