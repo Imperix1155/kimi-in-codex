@@ -142,9 +142,9 @@ export function resolveTtlMinutes(raw) {
   if (!Number.isInteger(value) || value < 1) {
     throw new Error("--ttl-minutes requires a whole number of minutes, at least 1.");
   }
-  if (value > DEFAULT_TTL_MINUTES) {
+  if (value > HARD_CEILING_TTL_MINUTES) {
     throw new Error(
-      `--ttl-minutes may only lower the ${DEFAULT_TTL_MINUTES}-minute default (the runtime's hard ceiling is ${HARD_CEILING_TTL_MINUTES} minutes).`
+      `--ttl-minutes may not exceed the runtime's hard ceiling of ${HARD_CEILING_TTL_MINUTES} minutes (default ${DEFAULT_TTL_MINUTES}).`
     );
   }
   return value;

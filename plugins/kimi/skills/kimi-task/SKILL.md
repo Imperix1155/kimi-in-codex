@@ -71,9 +71,10 @@ call returns. Everything in steps 1 and 3-5 still applies.
   be recovered from the job record.
 - **The prompt text and the result are written to disk** in the plugin's state
   directory and stay there until the job record is removed.
-- `--ttl-minutes` may only lower the 30-minute default; the runtime's hard
-  ceiling is 60 minutes. At the deadline the job is terminated and reported
-  `failed`, never silently extended and never auto-resumed.
+- `--ttl-minutes` may be set between 1 and 60; the 30-minute default applies
+  when it is unset, and the runtime's hard ceiling is 60 minutes. At the
+  deadline the job is terminated and reported `failed`, never silently
+  extended and never auto-resumed.
 
 Run exactly one foreground invocation with the Codex shell tool:
 

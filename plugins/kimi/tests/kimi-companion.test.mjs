@@ -1521,7 +1521,9 @@ function listLeakedTestProcesses() {
   for (const [args, pattern] of [
     [["--resume-last"], /--resume-last|resume/i],
     [["--resume"], /--resume-last|resume/i],
-    [["--write", "edit something"], /write/i]
+    [["--write", "edit something"], /write/i],
+    // §14 Q2: TTL accepts 1-60; above the 60-minute hard ceiling is refused.
+    [["--ttl-minutes", "61", "x"], /60/]
   ]) {
     const refused = launchBackground([...args], context);
     assert.notEqual(refused.status, 0, `--codex-background ${args.join(" ")} must be refused`);
@@ -1536,6 +1538,11 @@ function listLeakedTestProcesses() {
   const missingJson = runCli(["task", "--codex-background", "x"], context);
   assert.notEqual(missingJson.status, 0, "background launch without --json must fail");
   assert.match(missingJson.stderr, /--json/);
+
+  // §14 Q2 boundary: exactly the 60-minute ceiling is accepted, default is 30.
+  const { resolveTtlMinutes } = await import(new URL("../scripts/lib/codex-jobs.mjs", import.meta.url));
+  assert.equal(resolveTtlMinutes("60"), 60, "the 60-minute ceiling itself must be accepted");
+  assert.equal(resolveTtlMinutes(null), 30, "unset TTL must default to 30 minutes");
 
   // Nothing above may have created a job.
   const list = runCli(["status", "--codex-jobs", "--json"], context);

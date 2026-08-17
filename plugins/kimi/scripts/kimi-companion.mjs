@@ -107,7 +107,7 @@ function printUsage() {
       "  node <plugin-root>/scripts/kimi-companion.mjs review --diff-file <path> --diff-sha256 <64-hex> [--wait] [--model <id|highspeed|k3>] [focus text]",
       "  node <plugin-root>/scripts/kimi-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <id|highspeed|k3>] [focus text]  # legacy live-Git mode",
       "  node <plugin-root>/scripts/kimi-companion.mjs task --codex-once --json [--write|--read-only] [--fresh|--resume-session <id>] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
-      "  node <plugin-root>/scripts/kimi-companion.mjs task --codex-background --json [--read-only] [--ttl-minutes <1-30>] [--model <id|highspeed|k3>] --prompt-file <path>",
+      "  node <plugin-root>/scripts/kimi-companion.mjs task --codex-background --json [--read-only] [--ttl-minutes <1-60>] [--model <id|highspeed|k3>] --prompt-file <path>",
       "  node <plugin-root>/scripts/kimi-companion.mjs status --codex-job <exact-id> [--claim <token>] --json",
       "  node <plugin-root>/scripts/kimi-companion.mjs result --codex-job <exact-id> --claim <token> --json",
       "  node <plugin-root>/scripts/kimi-companion.mjs cancel --codex-job <exact-id> --json",

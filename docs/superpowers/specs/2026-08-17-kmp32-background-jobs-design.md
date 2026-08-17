@@ -298,8 +298,9 @@ Plus the standing gates: all eight deterministic sentinels on the exact head, pl
 ## 14. Owner decisions (ratified 2026-08-17)
 
 - **Q1 — read-only background only in this phase.** `--codex-background` refuses `--write` at launch with a message naming write background as a deliberate future decision; the job record's `write` field stays (sealed `false`) so the state machine is already write-ready. Write delegation remains foreground-only (`--codex-once --write`).
-- **Q2 — TTL 30-minute default, 60-minute hard ceiling** enforced in the runtime; `--ttl-minutes` may only lower the default. Expiry terminates and reports `failed`/"deadline exceeded" truthfully. The ceiling appears verbatim in the launch justification text.
+- **Q2 — TTL 30-minute default, 60-minute hard ceiling** enforced in the runtime; `--ttl-minutes` accepts 1–60 (driver ruling 2026-08-17 resolving the §6 wording ambiguity in favor of the ratified 60-minute ceiling). Expiry terminates and reports `failed`/"deadline exceeded" truthfully. The ceiling appears verbatim in the launch justification text.
 - **Q3 — cancel and status metadata are token-free**; result/content (including `sessionId`) stays claim-token-gated.
+- **Implementation ruling (2026-08-17):** the legacy Claude-surface CLI (`status --all`, `result <job-id>`) can still read a Codex background record token-free. Kept deliberately: the on-disk record stores prompt/result in plaintext, so a local caller can read the file directly — the token binds Codex conversations to content on the Codex skill surface (which only uses `--codex-job` forms); gating the legacy CLI would add ritual, not security. Consistent with §10's same-user threat model.
 
 ## Critical files for implementation
 
