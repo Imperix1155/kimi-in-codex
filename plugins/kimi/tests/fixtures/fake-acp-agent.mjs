@@ -424,7 +424,7 @@ rl.on("line", (line) => {
         }
         send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "delayed write completed" } } } });
         send({ id: promptId, result: { stopReason: "end_turn" } });
-      }, 750);
+      }, Number(process.env.KIMI_FAKE_CANCEL_WRITE_DELAY_MS) || 750);
       return;
     }
 

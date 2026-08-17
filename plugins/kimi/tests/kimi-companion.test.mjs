@@ -540,6 +540,19 @@ function pathToImport(relative) {
     assert.notEqual(invalid.status, 0, `one-shot arguments must fail: ${args.join(" ")}`);
     assert.equal(JSON.parse(invalid.stdout).taskStatus, "FAILED");
   }
+
+  // One-shot output is JSON-only, so --json is required up front; the error
+  // is plain text on stderr because no JSON output was requested.
+  const missingJson = runCli(["task", "--codex-once", "x"], { env, cwd });
+  assert.notEqual(missingJson.status, 0, "one-shot without --json must fail");
+  assert.match(missingJson.stderr, /require --json/);
+  assert.equal(missingJson.stdout.trim(), "");
+
+  // --codex-once=false is NOT one-shot intent (parseArgs semantics): a
+  // failure on the resulting legacy path must not emit the one-shot envelope.
+  const disabledOnce = runCli(["task", "--json", "--codex-once=false", "--resume-last"], { env, cwd });
+  assert.notEqual(disabledOnce.status, 0, "legacy resume-last with no prior task must fail");
+  assert.equal(Object.hasOwn(JSON.parse(disabledOnce.stdout), "taskStatus"), false);
   shutdownBroker(env, cwd);
 }
 
@@ -553,11 +566,16 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   const promptMarker = path.join(markerDir, "prompt-active.txt");
   const cancelMarker = path.join(markerDir, "cancel-received.txt");
   const postCancelMarker = path.join(markerDir, "post-cancel-write.txt");
+  // The fixture's delayed write must stay comfortably ahead of poll and
+  // scheduling jitter on loaded CI hosts; the post-exit negative check below
+  // waits past this same delay so "no post-cancel write" stays meaningful.
+  const cancelWriteDelayMs = 3000;
   const env = {
     ...baseEnv,
     KIMI_FAKE_PROMPT_MARKER: promptMarker,
     KIMI_FAKE_CANCEL_MARKER: cancelMarker,
-    KIMI_FAKE_POST_CANCEL_MARKER: postCancelMarker
+    KIMI_FAKE_POST_CANCEL_MARKER: postCancelMarker,
+    KIMI_FAKE_CANCEL_WRITE_DELAY_MS: String(cancelWriteDelayMs)
   };
   const child = spawn(process.execPath, [
     CLI, "task", "--codex-once", "--write", "--json", `interrupt with ${signal}`
@@ -585,7 +603,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   assert.ok(exited, `${signal} one-shot process did not exit inside the deadline`);
   assert.notEqual(exited.code, 0, `${signal} cancellation must exit nonzero; stdout: ${stdout}; stderr: ${stderr}`);
 
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  await new Promise((resolve) => setTimeout(resolve, cancelWriteDelayMs + 250));
   assert.deepEqual(
     { cancelReceived: fs.existsSync(cancelMarker), postCancelWrite: fs.existsSync(postCancelMarker) },
     { cancelReceived: true, postCancelWrite: false },

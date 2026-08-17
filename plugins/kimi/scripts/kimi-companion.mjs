@@ -792,6 +792,11 @@ async function handleTask(argv) {
   if (codexOnce && options.background) {
     throw new Error("Codex one-shot tasks do not support --background; durable jobs remain deferred.");
   }
+  // One-shot output is the JSON envelope on success AND failure; without
+  // --json the two paths would disagree, so the flag is required up front.
+  if (codexOnce && !options.json) {
+    throw new Error("Codex one-shot tasks require --json.");
+  }
   if (codexOnce && resumeLast) {
     throw new Error("Codex one-shot resume requires --resume-session <exact-session-id>.");
   }
@@ -1148,7 +1153,12 @@ function hasFrozenReviewIntent(argv) {
 }
 
 function hasCodexOneShotIntent(argv) {
-  return argv[0] === "task" && argv.some((arg) => arg === "--codex-once" || arg.startsWith("--codex-once="));
+  // Mirror parseArgs boolean semantics: --codex-once=false is NOT one-shot
+  // intent, so failures on the legacy path never emit the one-shot envelope.
+  return (
+    argv[0] === "task" &&
+    argv.some((arg) => arg === "--codex-once" || (arg.startsWith("--codex-once=") && arg !== "--codex-once=false"))
+  );
 }
 
 function normalizeProcessCommandArgv(argv) {
