@@ -799,6 +799,43 @@ export async function cancelKimiSession(cwd, { sessionId }) {
   }
 }
 
+// KMP-32: ask the live broker what is actually in flight. This is the
+// CONFIRMATION half of cancellation: killing a worker only proves a signal
+// was delivered, while the broker deliberately keeps a dead socket's turn
+// alive. Never spawns a broker — a runtime that is not up cannot be running
+// a turn, and that fact is itself reported (`running: false`).
+export async function probeBrokerStatus(cwd) {
+  const endpoint = loadBrokerSession(cwd)?.endpoint ?? null;
+  if (!endpoint) {
+    return { reachable: false, running: false, detail: "no shared Kimi runtime is active", activeSessions: [] };
+  }
+  let client = null;
+  try {
+    client = await AcpClient.connect(cwd, { brokerEndpoint: endpoint });
+    const result = await client.request("broker/status", {});
+    const activeSessions = Array.isArray(result?.activeSessions) ? result.activeSessions : [];
+    return {
+      reachable: true,
+      running: true,
+      agentAlive: result?.agentAlive !== false,
+      busy: Boolean(result?.busy),
+      activeSessions,
+      detail: `broker/status reported ${activeSessions.length} session(s) in flight`
+    };
+  } catch (error) {
+    return {
+      reachable: false,
+      // The endpoint was recorded but did not answer: we do NOT know whether
+      // a turn is in flight, so this can never count as confirmation.
+      running: true,
+      activeSessions: [],
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    await client?.close().catch(() => {});
+  }
+}
+
 // Runs one prompt turn with capture. Notifications for sessions without an
 // active capture go to the handler that was installed before the first
 // capture; the base handler is restored once the last capture ends. Callers

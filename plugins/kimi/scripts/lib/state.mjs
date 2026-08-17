@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { assertJobId, isActiveCodexStatus } from "./codex-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -163,10 +164,19 @@ export function loadState(cwd) {
   }
 }
 
+// KMP-32: an ACTIVE job is never pruned, however old its index entry looks.
+// `updatedAt` is not a liveness proxy — createJobProgressUpdater upserts
+// only when the phase/threadId/turnId CHANGES, so a long quiet turn goes
+// stale in the index while its worker is still running. Pruning it would
+// delete the record and log of a live detached process.
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort((left, right) =>
+    String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
+  );
+  const active = sorted.filter((job) => isActiveCodexStatus(job.status));
+  const activeIds = new Set(active.map((job) => job.id));
+  const retained = sorted.filter((job) => !activeIds.has(job.id)).slice(0, Math.max(0, MAX_JOBS - active.length));
+  return sorted.filter((job) => activeIds.has(job.id) || retained.includes(job));
 }
 
 function removeFileIfExists(filePath) {
@@ -263,8 +273,11 @@ export function updateState(cwd, mutate) {
   }
 }
 
+// The suffix is padded to a FIXED six characters: the strict job-id pattern
+// that guards every filesystem path is exact, so a generator that can emit
+// a short suffix would occasionally mint an id its own validator rejects.
 export function generateJobId(prefix = "job") {
-  const random = Math.random().toString(36).slice(2, 8);
+  const random = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
   return `${prefix}-${Date.now().toString(36)}-${random}`;
 }
 
@@ -322,12 +335,17 @@ function removeJobFile(jobFile) {
   }
 }
 
+// Both path builders validate the id FIRST. This is the single chokepoint
+// every caller-supplied job reference reaches, so `../state` can never be
+// joined into a real, parseable file inside the state dir.
 export function resolveJobLogFile(cwd, jobId) {
+  assertJobId(jobId);
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
 }
 
 export function resolveJobFile(cwd, jobId) {
+  assertJobId(jobId);
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }

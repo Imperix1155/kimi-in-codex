@@ -69,6 +69,109 @@ function makeWorkspace(scenario) {
   return { cwd, env };
 }
 
+// KMP-32 background workspaces. The Codex background launch REFUSES the
+// KIMI_COMPANION_AGENT_SPAWN seam by design (§6 mitigation 3 — under that
+// override getKimiAvailability returns available unconditionally, so a
+// detached worker could outlive the shell that set it). Background
+// scenarios therefore reach the scripted agent through a `kimi` SHIM on
+// PATH: real discovery, real curated-env spawn, no override anywhere.
+function makeBackgroundWorkspace(scenario, fakeEnv = {}) {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-bg-"));
+  const pluginData = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-data-"));
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-shim-"));
+  const exports = Object.entries(fakeEnv)
+    .map(([key, value]) => `export ${key}=${JSON.stringify(String(value))}`)
+    .join("\n");
+  fs.writeFileSync(
+    path.join(shimDir, "kimi"),
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "--version" ]; then echo "kimi, version 1.49.0"; exit 0; fi',
+      'if [ "$1" = "acp" ]; then',
+      exports,
+      `  exec ${JSON.stringify(process.execPath)} ${JSON.stringify(FIXTURE)} ${JSON.stringify(scenario)}`,
+      "fi",
+      'echo "unsupported kimi invocation: $*" >&2',
+      "exit 1",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  fs.chmodSync(path.join(shimDir, "kimi"), 0o755);
+
+  const env = {
+    ...process.env,
+    // The curated worker env forwards KIMI_COMPANION_DATA, so the launcher
+    // and the detached worker must agree on it or they resolve different
+    // state dirs and the job hangs queued forever.
+    KIMI_COMPANION_DATA: pluginData,
+    PATH: `${shimDir}:${path.dirname(process.execPath)}:/usr/bin:/bin`
+  };
+  delete env.KIMI_COMPANION_AGENT_SPAWN;
+  delete env.CLAUDE_PLUGIN_DATA;
+  cleanupTargets.push({ env, cwd });
+  return { cwd, env, pluginData, shimDir };
+}
+
+function launchBackground(args, { env, cwd }) {
+  const run = runCli(["task", "--codex-background", "--json", ...args], { env, cwd });
+  return { ...run, payload: run.stdout.trim() ? JSON.parse(run.stdout) : null };
+}
+
+function codexStatus(jobId, { env, cwd, claim = null }) {
+  const args = ["status", "--codex-job", jobId, "--json"];
+  if (claim) {
+    args.push("--claim", claim);
+  }
+  const run = runCli(args, { env, cwd });
+  return { ...run, payload: run.stdout.trim() ? JSON.parse(run.stdout) : null };
+}
+
+// Reads the durable job record through the REAL resolver, so a test can
+// assert what was persisted (e.g. the claim token hash, never the token).
+function readCodexJobFile(jobId, { env, cwd }) {
+  const script = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      const file = state.resolveJobFile(process.argv[1], process.argv[3]);
+      process.stdout.write(JSON.stringify(state.readJobFile(file)));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", script, cwd, pathToImport("../scripts/lib/state.mjs"), jobId],
+    { env, cwd, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(probe.status, 0, `could not read job record ${jobId}: ${probe.stderr}`);
+  return JSON.parse(probe.stdout);
+}
+
+function writeCodexJobFile(jobId, record, { env, cwd }) {
+  const script = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      state.writeJobFile(process.argv[1], process.argv[3], JSON.parse(process.argv[4]));
+      state.upsertJob(process.argv[1], { id: process.argv[3], status: JSON.parse(process.argv[4]).status });
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", script, cwd, pathToImport("../scripts/lib/state.mjs"), jobId, JSON.stringify(record)],
+    { env, cwd, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(probe.status, 0, `could not write job record ${jobId}: ${probe.stderr}`);
+}
+
+async function pollCodexJobStatus(jobId, wanted, context, timeoutMs = 25_000) {
+  return pollUntil(() => {
+    const snapshot = codexStatus(jobId, context);
+    if (snapshot.status !== 0 || !snapshot.payload?.job) {
+      return null;
+    }
+    return wanted.includes(snapshot.payload.job.status) ? snapshot.payload : null;
+  }, timeoutMs);
+}
+
 async function pollUntil(fn, timeoutMs = 20_000, intervalMs = 250) {
   const start = Date.now();
   for (;;) {
@@ -1235,6 +1338,11 @@ function listLeakedTestProcesses() {
       if (/fake-acp-agent\.mjs\s+\S/.test(line)) {
         return true;
       }
+      // KMP-32: a leaked DETACHED background worker is the new leak class —
+      // it outlives its launcher by design, so nothing else would catch it.
+      if (/kimi-companion\.mjs task-worker/.test(line) && /--cwd\s+\S*kmc-/.test(line)) {
+        return true;
+      }
       // Real test broker: serving with a test-workspace cwd or the test override.
       return /acp-broker\.mjs serve/.test(line) && (/--agent-spawn/.test(line) || /--cwd\s+\S*kmc-/.test(line));
     });
@@ -1282,6 +1390,217 @@ function listLeakedTestProcesses() {
   assert.doesNotMatch(run.stdout, /did not return a final message/, "old misleading string is gone");
   const status = runCli(["status", "--json", "--all"], { env, cwd });
   assert.equal(JSON.parse(status.stdout).latestFinished.status, "failed");
+  shutdownBroker(env, cwd);
+}
+
+// ---------------------------------------------------------------------------
+// KMP-32 — Codex background jobs. Numbering follows the design brief's §12
+// verification plan so a failing assertion maps straight back to the spec.
+// ---------------------------------------------------------------------------
+
+// §12 #1. Background launch mints an exact job id and a claim token, returns
+// the token exactly once (in the launch JSON), and persists ONLY its SHA-256.
+// The job is sealed read-only this phase and carries a TTL deadline.
+// §12 #3. status without a claim token returns coarse metadata and NO
+// content: never sessionId, rawOutput, toolOutputs, or progressPreview.
+// §12 #2. result refuses without a token, refuses a wrong token, and returns
+// content for the right one.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const promptFile = path.join(context.cwd, "bg-prompt.txt");
+  fs.writeFileSync(promptFile, "summarize the repository\n", "utf8");
+  const launch = launchBackground(["--prompt-file", promptFile], context);
+  assert.equal(launch.status, 0, `background launch failed: ${launch.stderr}`);
+  const { jobId, claimToken } = launch.payload;
+  assert.equal(launch.payload.launchStatus, "QUEUED");
+  assert.match(jobId, /^task-[0-9a-z]+-[0-9a-z]{6}$/, "job id must match the strict exact-id pattern");
+  assert.match(claimToken, /^[0-9a-f]{64}$/, "claim token must be 32 random bytes, hex encoded");
+  assert.equal(launch.payload.write, false, "read-only background is the only shipped mode this phase");
+  assert.equal(launch.payload.ttlMinutes, 30, "default TTL is 30 minutes");
+  assert.ok(Date.parse(launch.payload.ttlDeadline) > Date.now(), "launch must seal a wall-clock deadline");
+
+  const record = readCodexJobFile(jobId, context);
+  assert.equal(
+    record.claimTokenHash,
+    createHash("sha256").update(claimToken).digest("hex"),
+    "the record must store the token hash"
+  );
+  assert.equal(
+    JSON.stringify(record).includes(claimToken),
+    false,
+    "the plaintext claim token must never be persisted"
+  );
+  assert.equal(record.write, false, "write authority is sealed false at launch");
+  assert.equal(record.codexBackground, true);
+  assert.ok(record.authoritySeal, "launch must seal its authority grant");
+  assert.ok(Number.isFinite(record.bootId), "launch must record a boot identity for reboot-safe reconciliation");
+
+  const completed = await pollCodexJobStatus(jobId, ["completed"], context);
+  assert.ok(completed, "background job never completed");
+
+  // Unauthenticated status: metadata only.
+  const coarse = codexStatus(jobId, context);
+  assert.equal(coarse.status, 0, coarse.stderr);
+  assert.equal(coarse.payload.authenticated, false);
+  assert.equal(coarse.payload.content, null);
+  assert.equal(coarse.payload.job.status, "completed");
+  assert.equal(coarse.payload.job.write, false);
+  assert.equal(coarse.payload.job.jobId, jobId);
+  assert.ok(coarse.payload.job.ttlDeadline, "deadline is metadata the user may see without a token");
+  const coarseText = JSON.stringify(coarse.payload);
+  assert.equal(Object.hasOwn(coarse.payload.job, "sessionId"), false, "sessionId is content: never in coarse metadata");
+  for (const leaked of ["sess-1", "slow done", "summarize the repository"]) {
+    assert.equal(coarseText.includes(leaked), false, `coarse status leaked content: ${leaked}`);
+  }
+  for (const contentKey of ["rawOutput", "toolOutputs", "progressPreview", "result", "rendered", "request"]) {
+    assert.equal(coarseText.includes(`"${contentKey}"`), false, `coarse status leaked ${contentKey}`);
+  }
+
+  // Authenticated status: sessionId and progress become visible.
+  const authenticated = codexStatus(jobId, { ...context, claim: claimToken });
+  assert.equal(authenticated.status, 0, authenticated.stderr);
+  assert.equal(authenticated.payload.authenticated, true);
+  assert.equal(authenticated.payload.content.sessionId, "sess-1");
+
+  // result: token required, wrong token refused, right token returns content.
+  const noToken = runCli(["result", "--codex-job", jobId, "--json"], context);
+  assert.notEqual(noToken.status, 0, "result without a claim token must be refused");
+  assert.match(noToken.stderr, /claim token/i);
+  assert.equal(noToken.stderr.includes("slow done"), false, "a refusal must not leak content");
+
+  const wrongToken = runCli(["result", "--codex-job", jobId, "--claim", "f".repeat(64), "--json"], context);
+  assert.notEqual(wrongToken.status, 0, "a wrong claim token must be refused");
+  assert.match(wrongToken.stderr, /claim token/i);
+  assert.equal(wrongToken.stdout.includes("slow done"), false, "a rejected token must not leak content");
+
+  // A malformed token must be refused too, never crash the constant-time compare.
+  const malformedToken = runCli(["result", "--codex-job", jobId, "--claim", "nope", "--json"], context);
+  assert.notEqual(malformedToken.status, 0);
+  assert.match(malformedToken.stderr, /claim token/i);
+
+  const authorized = runCli(["result", "--codex-job", jobId, "--claim", claimToken, "--json"], context);
+  assert.equal(authorized.status, 0, authorized.stderr);
+  const resultPayload = JSON.parse(authorized.stdout);
+  assert.equal(resultPayload.job.jobId, jobId);
+  assert.equal(resultPayload.result.sessionId, "sess-1");
+  assert.match(resultPayload.result.rawOutput, /slow done/);
+  shutdownBroker(context.env, context.cwd);
+}
+
+// §12 #4. At most one active background job per workspace. A second launch
+// is refused at launch time, naming the blocking job and its state.
+{
+  const context = makeBackgroundWorkspace("cancel-ignored");
+  const first = launchBackground(["hold the runtime"], context);
+  assert.equal(first.status, 0, first.stderr);
+  const running = await pollCodexJobStatus(first.payload.jobId, ["running"], context, 15_000);
+  assert.ok(running, "first background job never reached running");
+
+  const second = launchBackground(["second job"], context);
+  assert.notEqual(second.status, 0, "a second concurrent background job must be refused");
+  assert.equal(second.payload.launchStatus, "REFUSED");
+  assert.match(second.payload.error, new RegExp(first.payload.jobId));
+  assert.match(second.payload.error, /running/);
+
+  // Cleanup: stop the held turn so the suite leaves nothing behind.
+  runCli(["cancel", "--codex-job", first.payload.jobId, "--json"], context);
+  shutdownBroker(context.env, context.cwd);
+}
+
+// §12 #5 + §14 Q1. Background launch refuses resume-by-history, refuses
+// --write (write-enabled background is a deliberate separate decision), and
+// requires --json for its machine-readable envelope.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  for (const [args, pattern] of [
+    [["--resume-last"], /--resume-last|resume/i],
+    [["--resume"], /--resume-last|resume/i],
+    [["--write", "edit something"], /write/i]
+  ]) {
+    const refused = launchBackground([...args], context);
+    assert.notEqual(refused.status, 0, `--codex-background ${args.join(" ")} must be refused`);
+    assert.equal(refused.payload.launchStatus, "REFUSED");
+    assert.match(refused.payload.error, pattern);
+  }
+  // The write refusal must name write background as a future decision, not
+  // pretend the mode does not exist.
+  const writeRefusal = launchBackground(["--write", "edit something"], context);
+  assert.match(writeRefusal.payload.error, /--codex-once --write|foreground/i);
+
+  const missingJson = runCli(["task", "--codex-background", "x"], context);
+  assert.notEqual(missingJson.status, 0, "background launch without --json must fail");
+  assert.match(missingJson.stderr, /--json/);
+
+  // Nothing above may have created a job.
+  const list = runCli(["status", "--codex-jobs", "--json"], context);
+  assert.equal(list.status, 0, list.stderr);
+  assert.deepEqual(JSON.parse(list.stdout).jobs, [], "a refused launch must never create a record");
+}
+
+// §12 #7. Launch is refused outright under KIMI_COMPANION_AGENT_SPAWN: that
+// override makes availability unconditionally true, so a detached worker
+// could outlive the shell that set the seam.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const env = {
+    ...context.env,
+    KIMI_COMPANION_AGENT_SPAWN: JSON.stringify({ command: process.execPath, args: [FIXTURE, "slow-prompt"] })
+  };
+  const refused = launchBackground(["x"], { ...context, env });
+  assert.notEqual(refused.status, 0, "background launch must refuse the agent spawn override");
+  assert.equal(refused.payload.launchStatus, "REFUSED");
+  assert.match(refused.payload.error, /KIMI_COMPANION_AGENT_SPAWN/);
+}
+
+// §12 #6. Job ids are validated against the strict pattern BEFORE any path
+// is constructed. `../state` is the sharp case: it resolves to a real,
+// parseable file inside the state dir, so an unvalidated id would succeed.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const launch = launchBackground(["seed a state file"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  await pollCodexJobStatus(launch.payload.jobId, ["completed", "failed"], context);
+
+  for (const badId of [
+    "../state",
+    "../../x",
+    "task-abc",
+    launch.payload.jobId.slice(0, 12),
+    `${launch.payload.jobId}/../state`,
+    "task-1-ABCDEF",
+    ""
+  ]) {
+    for (const command of ["status", "result", "cancel"]) {
+      const args = [command, "--codex-job", badId, "--json"];
+      if (command === "result") {
+        args.push("--claim", launch.payload.claimToken);
+      }
+      const run = runCli(args, context);
+      assert.notEqual(run.status, 0, `${command} must reject job id ${JSON.stringify(badId)}`);
+      const combined = run.stdout + run.stderr;
+      assert.match(combined, /job id/i, `${command} ${JSON.stringify(badId)} must fail on id validation`);
+      assert.doesNotMatch(combined, /ENOENT|no such file/i, "validation must precede any filesystem access");
+      assert.doesNotMatch(combined, /stopReviewGate/, "an unvalidated id must never read state.json");
+    }
+  }
+  // task-worker takes an id from the same untrusted surface.
+  const worker = runCli(["task-worker", "--job-id", "../state", "--cwd", context.cwd], context);
+  assert.notEqual(worker.status, 0);
+  assert.match(worker.stderr, /job id/i);
+  shutdownBroker(context.env, context.cwd);
+}
+
+// Legacy Claude-surface behavior is untouched: bare status/result/cancel and
+// the legacy --background path keep prefix references and session filtering.
+{
+  const { cwd, env } = makeWorkspace("basic");
+  const run = runCli(["task", "legacy path"], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const report = JSON.parse(runCli(["status", "--json", "--all"], { env, cwd }).stdout);
+  const legacyId = report.latestFinished.id;
+  const byPrefix = runCli(["status", legacyId.slice(0, 10), "--json"], { env, cwd });
+  assert.equal(byPrefix.status, 0, "legacy prefix matching must still work");
+  assert.equal(JSON.parse(byPrefix.stdout).job.id, legacyId);
   shutdownBroker(env, cwd);
 }
 
