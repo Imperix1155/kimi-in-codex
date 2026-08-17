@@ -488,14 +488,18 @@ function pathToImport(relative) {
   assert.equal(firstPayload.taskStatus, "COMPLETED");
   assert.match(firstPayload.rawOutput, /fresh-session/);
 
+  // This is the documented shell-array expansion shape: the flag and exact
+  // session ID are separate argv elements, so Kimi must issue session/load.
+  const documentedResumeArgs = ["--resume-session", firstPayload.sessionId];
   const resumed = runCli([
-    "task", "--codex-once", "--resume-session", firstPayload.sessionId, "--json"
+    "task", "--codex-once", ...documentedResumeArgs, "--json"
   ], { env, cwd });
   assert.equal(resumed.status, 0, resumed.stderr);
   const resumedPayload = JSON.parse(resumed.stdout);
   assert.equal(resumedPayload.taskStatus, "COMPLETED");
   assert.equal(resumedPayload.sessionId, firstPayload.sessionId);
   assert.match(resumedPayload.rawOutput, /resumed-session/);
+  assert.doesNotMatch(resumedPayload.rawOutput, /fresh-session/);
 
   for (const args of [
     ["--codex-once", "--background", "x"],

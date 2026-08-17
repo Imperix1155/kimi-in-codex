@@ -21,19 +21,30 @@ Hand one foreground task to Kimi and return its terminal result. The default is 
    - Use `--fresh` for a new task by default.
    - Use `--resume-session <exact-session-id>` only when the user supplies the exact ID returned by a successful `$kimi-task` call in this conversation.
    - Do not infer an ID from repository history or use legacy resume selectors. Fresh and exact resume are mutually exclusive.
+   - Represent the chosen mode as an argument array: fresh is `SESSION_ARGS=(--fresh)`; exact resume is `SESSION_ARGS=(--resume-session "${SESSION_ID}")`. The flag and ID are two separate array elements.
 
 4. Preserve the user's task text exactly: write it once as UTF-8 to a unique temporary prompt file outside the repository. Do not trim, concatenate, or substitute the prompt; remove the temporary file in `finally` after the runtime returns.
-5. Build the runtime argument array from literal flags plus separate values. Do not interpolate an untrusted model, session ID, or path into a shell string. `MODEL_ARGS` is either empty or the two separate arguments `--model` and an explicitly selected supported model (`highspeed`, `k3`, or an exact supported model ID).
+5. Build the runtime argument array from literal flags plus separate values. Do not interpolate an untrusted model, session ID, or path into a shell string, and do not use a compound `SESSION_FLAG` value. `MODEL_ARGS` is either empty or the two separate arguments `--model` and an explicitly selected supported model (`highspeed`, `k3`, or an exact supported model ID).
 6. Run exactly one foreground invocation with the Codex shell tool.
 
    - `sandbox_permissions: "require_escalated"`
    - For read-only: `justification: "Allow the authenticated local Kimi runtime to run with normal user filesystem authority (not an OS sandbox) so it can access ~/.kimi state/logs and its model service? ACP will reject mutation and shell/execute requests for this read-only task."`
    - For write: `justification: "Allow the authenticated local Kimi runtime to run with normal user filesystem write authority (not an OS sandbox) so it can access ~/.kimi state/logs and its model service and perform the user-approved edits?"`
 
-   Do not first attempt the command inside the sandbox. Do not retry after denied elevation or a failed runtime call. The following is the single command shape, rendered only from the separately constructed argument array:
+   Do not first attempt the command inside the sandbox. Do not retry after denied elevation or a failed runtime call. Use zsh/Bash argument arrays; the `node` line below is the one foreground invocation. `SESSION_ID` and `MODEL_ID` are values in their own quoted array elements, never raw fragments subject to word splitting.
 
    ```bash
-   node "${PLUGIN_ROOT}/scripts/kimi-companion.mjs" task --codex-once --json --prompt-file "${PROMPT_FILE}" "${ACCESS_FLAG}" "${SESSION_FLAG}" ${MODEL_ARGS}
+   ACCESS_FLAG=--read-only # or --write after explicit user approval
+   SESSION_ARGS=(--fresh)
+   if [[ -n "${SESSION_ID:-}" ]]; then
+     SESSION_ARGS=(--resume-session "${SESSION_ID}")
+   fi
+   MODEL_ARGS=()
+   if [[ -n "${MODEL_ID:-}" ]]; then
+     MODEL_ARGS=(--model "${MODEL_ID}")
+   fi
+   TASK_ARGS=(task --codex-once --json --prompt-file "${PROMPT_FILE}" "${ACCESS_FLAG}" "${SESSION_ARGS[@]}" "${MODEL_ARGS[@]}")
+   node "${PLUGIN_ROOT}/scripts/kimi-companion.mjs" "${TASK_ARGS[@]}"
    ```
 
 7. Parse the JSON terminal result. Accept only `taskStatus` values `COMPLETED`, `CANCELLED`, or `FAILED`.

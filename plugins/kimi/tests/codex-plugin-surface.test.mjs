@@ -86,10 +86,25 @@ assert.deepEqual(
   "task skill frontmatter must contain only name and description"
 );
 assert.match(taskSkill, /task --codex-once --json/);
+assert.match(
+  taskSkill,
+  /SESSION_ARGS=\(--resume-session "\$\{SESSION_ID\}"\)/,
+  "task skill must construct --resume-session and its exact ID as separate argv elements"
+);
+assert.match(
+  taskSkill,
+  /"\$\{SESSION_ARGS\[@\]\}"/,
+  "task skill must expand session arguments without word splitting"
+);
+assert.doesNotMatch(
+  taskSkill,
+  /"\$\{SESSION_FLAG\}"/,
+  "task skill must not pass a compound resume flag as one argv element"
+);
 assert.equal(
-  taskSkill.match(/node "\$\{PLUGIN_ROOT\}\/scripts\/kimi-companion\.mjs" task/g)?.length,
+  taskSkill.match(/node "\$\{PLUGIN_ROOT\}\/scripts\/kimi-companion\.mjs" "\$\{TASK_ARGS\[@\]\}"/g)?.length,
   1,
-  "task skill must invoke the runtime exactly once"
+  "task skill must invoke the constructed argv exactly once"
 );
 assert.match(taskSkill, /sandbox_permissions:\s*["`]require_escalated["`]/);
 assert.match(taskSkill, /default.*read-only/i);
