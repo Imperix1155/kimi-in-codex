@@ -14,10 +14,13 @@ import { fileURLToPath } from "node:url";
 const FIXTURE = fileURLToPath(new URL("./fixtures/fake-acp-agent.mjs", import.meta.url));
 const CLI = fileURLToPath(new URL("../scripts/kimi-companion.mjs", import.meta.url));
 
+// KMP-32 added detached-worker scenarios: each launches a real broker and
+// agent, so the bound is higher — but it stays a HARD bound, because a hung
+// background job and a slow one look identical from here.
 const deadman = setTimeout(() => {
-  console.error("COMPANION-TESTS TIMEOUT after 90s");
+  console.error("COMPANION-TESTS TIMEOUT after 240s");
   process.exit(2);
-}, 90_000);
+}, 240_000);
 deadman.unref?.();
 
 function makeEnv(scenario, pluginData) {
@@ -150,8 +153,11 @@ function writeCodexJobFile(jobId, record, { env, cwd }) {
   const script = `
     (async () => {
       const state = await import(process.argv[2]);
-      state.writeJobFile(process.argv[1], process.argv[3], JSON.parse(process.argv[4]));
-      state.upsertJob(process.argv[1], { id: process.argv[3], status: JSON.parse(process.argv[4]).status });
+      const record = JSON.parse(process.argv[4]);
+      state.writeJobFile(process.argv[1], process.argv[3], record);
+      // The index is what the reconciler reads, so it must carry the same
+      // mutated record the durable file does.
+      state.upsertJob(process.argv[1], { ...record, id: process.argv[3] });
     })();
   `;
   const probe = spawnSync(
@@ -1587,6 +1593,227 @@ function listLeakedTestProcesses() {
   const worker = runCli(["task-worker", "--job-id", "../state", "--cwd", context.cwd], context);
   assert.notEqual(worker.status, 0);
   assert.match(worker.stderr, /job id/i);
+  shutdownBroker(context.env, context.cwd);
+}
+
+// §12 #8. The worker acts on the SEALED record, never the request payload.
+// Mutating the record after launch (widening write) breaks the seal; mutating
+// only the request payload is caught by the record/payload comparison. Both
+// must fail loudly BEFORE any turn starts.
+{
+  const startMarker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kmc-seal-")), "agent-started.txt");
+  const context = makeBackgroundWorkspace("slow-prompt", { KIMI_FAKE_START_MARKER: startMarker });
+  const launch = launchBackground(["seal check"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(jobId, ["completed"], context), "seed job never completed");
+  const sealed = readCodexJobFile(jobId, context);
+  shutdownBroker(context.env, context.cwd);
+
+  for (const [label, mutate, pattern] of [
+    [
+      "record write widened after launch",
+      (record) => ({ ...record, write: true, status: "queued", pid: null }),
+      /sealed launch authority does not match|sealed read-only/i
+    ],
+    [
+      "request payload write diverges from the sealed record",
+      (record) => ({ ...record, status: "queued", pid: null, request: { ...record.request, write: true } }),
+      /request payload's write authority/i
+    ]
+  ]) {
+    writeCodexJobFile(jobId, mutate(sealed), context);
+    fs.rmSync(startMarker, { force: true });
+    const worker = runCli(["task-worker", "--job-id", jobId, "--cwd", context.cwd], context);
+    assert.notEqual(worker.status, 0, `${label}: worker must refuse to run`);
+    assert.match(worker.stderr, pattern, label);
+    assert.equal(fs.existsSync(startMarker), false, `${label}: no turn may start after a refused authority check`);
+  }
+  shutdownBroker(context.env, context.cwd);
+}
+
+// §12 #9. TTL is enforced EXTERNALLY too: a wedged worker will not honor its
+// own timer, so any reader past the deadline marks the job terminal — with
+// wording that claims only what was established.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const launch = launchBackground(["ttl probe"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(jobId, ["completed"], context), "seed job never completed");
+  const record = readCodexJobFile(jobId, context);
+  // A live worker (this test process) whose deadline has already passed.
+  writeCodexJobFile(
+    jobId,
+    {
+      ...record,
+      status: "running",
+      phase: "running",
+      pid: process.pid,
+      completedAt: null,
+      errorMessage: null,
+      ttlDeadline: new Date(Date.now() - 60_000).toISOString()
+    },
+    context
+  );
+  const expired = codexStatus(jobId, context);
+  assert.equal(expired.status, 0, expired.stderr);
+  assert.equal(expired.payload.job.status, "failed");
+  assert.match(expired.payload.job.errorMessage, /deadline exceeded/i);
+  assert.match(expired.payload.job.errorMessage, /liveness cannot be confirmed/i);
+  assert.doesNotMatch(expired.payload.job.errorMessage, /worker (?:process )?died/i, "the runtime must not claim what it did not establish");
+  shutdownBroker(context.env, context.cwd);
+}
+
+// §12 #10 + #11. Reconciliation across a reboot boundary must be terminal
+// WITHOUT probing or signalling any pid (pids are recycled), and MAX_JOBS
+// pruning must never evict an active job. Both are asserted directly against
+// the library with an injected liveness probe, so "no kill was issued" is a
+// measurement rather than an inference.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const probeScript = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      const jobControl = await import(process.argv[3]);
+      const codex = await import(process.argv[4]);
+      const workspaceRoot = process.argv[1];
+
+      // A record from BEFORE the last boot, with a pid that is very much alive.
+      const rebooted = {
+        id: "task-reboot0-aaaaaa",
+        codexBackground: true,
+        status: "running",
+        phase: "running",
+        pid: process.pid,
+        write: false,
+        workspaceRoot,
+        bootId: codex.currentBootId() - 86400000,
+        ttlDeadline: new Date(Date.now() + 600000).toISOString()
+      };
+      state.writeJobFile(workspaceRoot, rebooted.id, rebooted);
+      state.upsertJob(workspaceRoot, rebooted);
+
+      const livenessProbes = [];
+      jobControl.reconcileActiveJobs(workspaceRoot, {
+        isProcessAliveImpl: (pid) => { livenessProbes.push(pid); return true; }
+      });
+      const reconciled = state.listJobs(workspaceRoot).find((job) => job.id === rebooted.id);
+
+      // MAX_JOBS pruning: an ACTIVE job survives an index full of newer ones.
+      const survivor = {
+        id: "task-survive-bbbbbb",
+        codexBackground: true,
+        status: "running",
+        phase: "running",
+        pid: process.pid,
+        write: false,
+        workspaceRoot,
+        bootId: codex.currentBootId(),
+        ttlDeadline: new Date(Date.now() + 600000).toISOString(),
+        updatedAt: "1999-01-01T00:00:00.000Z"
+      };
+      state.upsertJob(workspaceRoot, survivor);
+      state.updateState(workspaceRoot, (s) => {
+        const entry = s.jobs.find((job) => job.id === survivor.id);
+        entry.updatedAt = "1999-01-01T00:00:00.000Z";
+      });
+      for (let index = 0; index < 60; index += 1) {
+        state.upsertJob(workspaceRoot, {
+          id: \`task-filler\${index.toString(36)}-cccccc\`,
+          status: "completed",
+          write: false,
+          workspaceRoot
+        });
+      }
+      const jobs = state.listJobs(workspaceRoot);
+      process.stdout.write(JSON.stringify({
+        livenessProbes,
+        status: reconciled?.status ?? null,
+        errorMessage: reconciled?.errorMessage ?? null,
+        survivorRetained: jobs.some((job) => job.id === survivor.id),
+        totalJobs: jobs.length
+      }));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      probeScript,
+      context.cwd,
+      pathToImport("../scripts/lib/state.mjs"),
+      pathToImport("../scripts/lib/job-control.mjs"),
+      pathToImport("../scripts/lib/codex-jobs.mjs")
+    ],
+    { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 20_000 }
+  );
+  assert.equal(probe.status, 0, `reconciler probe failed: ${probe.stderr}`);
+  const outcome = JSON.parse(probe.stdout);
+  assert.deepEqual(outcome.livenessProbes, [], "a bootId mismatch must be terminal without probing or signalling any pid");
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.errorMessage, /liveness cannot be confirmed/i);
+  assert.match(outcome.errorMessage, /reboot/i);
+  assert.doesNotMatch(outcome.errorMessage, /worker (?:process )?died/i);
+  assert.equal(outcome.survivorRetained, true, "an ACTIVE job must never be pruned by MAX_JOBS");
+}
+
+// §12 #12/#13 at the runtime level. Cancelling a job whose agent IGNORES
+// session/cancel must never print CANCELLED: the worker is dead and a signal
+// was delivered, but the turn is provably still in flight, so the honest
+// terminal state is `unknown` with the residual risk named.
+{
+  const context = makeBackgroundWorkspace("cancel-ignored");
+  const launch = launchBackground(["a turn that ignores cancellation"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+
+  const cancel = runCli(["cancel", "--codex-job", jobId, "--json"], context);
+  const payload = JSON.parse(cancel.stdout);
+  assert.equal(payload.cancelStatus, "UNKNOWN", `unconfirmed cancellation must not claim CANCELLED: ${cancel.stdout}`);
+  assert.equal(payload.confirmed, false);
+  assert.match(payload.residualRisk, /unconfirmed/i);
+  assert.match(payload.residualRisk, /read-only/i, "the residual-risk message must state the job's write standing");
+  assert.notEqual(cancel.status, 0, "an unconfirmed cancellation must exit nonzero");
+
+  const after = codexStatus(jobId, context);
+  assert.equal(after.payload.job.status, "unknown");
+  assert.match(after.payload.job.errorMessage, /unconfirmed/i);
+  shutdownBroker(context.env, context.cwd);
+}
+
+// The confirmed path still reaches a terminal CANCELLED: the agent honors
+// session/cancel, the worker records a cancelled stop reason, and cancel
+// reports that evidence by name.
+{
+  const context = makeBackgroundWorkspace("cancellable");
+  const launch = launchBackground(["a cancellable turn"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+
+  const cancel = runCli(["cancel", "--codex-job", jobId, "--json"], context);
+  assert.equal(cancel.status, 0, `confirmed cancel failed: ${cancel.stderr}`);
+  const payload = JSON.parse(cancel.stdout);
+  assert.equal(payload.cancelStatus, "CANCELLED");
+  assert.equal(payload.confirmed, true);
+  assert.match(payload.detail, /confirmed/i);
+  assert.equal(payload.residualRisk, null);
+  assert.equal(codexStatus(jobId, context).payload.job.status, "cancelled");
+  shutdownBroker(context.env, context.cwd);
+}
+
+// §12 fixture #3. Broker/agent death mid-turn is VERIFIED, not assumed: the
+// worker's pending session/prompt rejects and the job is recorded failed.
+{
+  const context = makeBackgroundWorkspace("broker-dies-mid-turn");
+  const launch = launchBackground(["a turn whose runtime dies"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  const failed = await pollCodexJobStatus(jobId, ["failed"], context, 20_000);
+  assert.ok(failed, "a dead broker must surface as a failed job, never a stuck running one");
+  assert.ok(failed.job.errorMessage, "the transport failure must be recorded, not swallowed");
   shutdownBroker(context.env, context.cwd);
 }
 
