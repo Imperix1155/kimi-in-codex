@@ -1,7 +1,6 @@
 ---
 name: kimi-result-handling
 description: Internal guidance for presenting Kimi helper output back to the user
-user-invocable: false
 ---
 
 # Kimi Result Handling
