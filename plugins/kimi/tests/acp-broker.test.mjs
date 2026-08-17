@@ -277,6 +277,101 @@ await withBroker("slow-prompt", async (session, cwd) => {
   }
 }
 
+// 8c. KMP-32 (§12 #12). broker/status is answered LOCALLY and BEFORE the
+// busy gate: a probe arriving while another socket owns an in-flight turn
+// must get the real answer, naming the exact session in flight. Placed
+// after the gate it would return BROKER_BUSY and the caller would learn
+// nothing — which is the entire point of the method.
+await withBroker("slow-prompt-3s", async (session, cwd) => {
+  const clientA = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+  await clientA.request("session/new", { cwd, mcpServers: [] });
+  const turn = clientA.request("session/prompt", { sessionId: "sess-1", prompt: [{ type: "text", text: "x" }] });
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  const clientB = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+  // Proves the broker really is busy for ordinary methods on this socket.
+  let busy = null;
+  try {
+    await clientB.request("session/new", { cwd, mcpServers: [] });
+  } catch (error) {
+    busy = error;
+  }
+  assert.ok(busy, "expected a busy error for an ordinary method while the turn runs");
+  assert.equal(busy.code, BROKER_BUSY_RPC_CODE);
+
+  const status = await clientB.request("broker/status", {});
+  assert.equal(status.agentAlive, true);
+  assert.equal(status.busy, true, "broker/status must report the busy state, not be blocked by it");
+  assert.deepEqual(status.activeSessions, ["sess-1"], "broker/status must name the exact in-flight session");
+
+  await turn;
+  const idle = await clientB.request("broker/status", {});
+  assert.equal(idle.busy, false);
+  assert.deepEqual(idle.activeSessions, [], "a settled turn must leave no active session behind");
+  await clientA.close();
+  await clientB.close();
+});
+
+// 8d. KMP-32 (§12 #13). Background-worker shape of disconnect cancellation:
+// the owning socket dies, the broker fires session/cancel for that exact
+// session — and when the agent IGNORES it the turn stays in flight, which
+// broker/status reports truthfully. This is the evidence a cancel caller
+// needs to refuse a false terminal CANCELLED.
+{
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-survive-marker-"));
+  const cancelMarker = path.join(markerDir, "cancelled.txt");
+  const previousCancelMarker = process.env.KIMI_FAKE_CANCEL_MARKER;
+  const previousSurviveDelay = process.env.KIMI_FAKE_SURVIVE_DELAY_MS;
+  process.env.KIMI_FAKE_CANCEL_MARKER = cancelMarker;
+  process.env.KIMI_FAKE_SURVIVE_DELAY_MS = "4000";
+  try {
+    await withBroker("turn-survives-socket-death", async (session, cwd) => {
+      const worker = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      const workerSession = await newSession(worker, cwd);
+      await worker.setSessionPermissionDecision(workerSession.sessionId, "reject", {
+        cancelOnDisconnect: true
+      });
+      worker.request("session/prompt", {
+        sessionId: workerSession.sessionId,
+        prompt: [{ type: "text", text: "detached background turn" }]
+      }).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      worker.socket.destroy();
+
+      const observer = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      let cancelSeen = false;
+      const deadline = Date.now() + 2000;
+      while (!cancelSeen && Date.now() < deadline) {
+        cancelSeen = fs.existsSync(cancelMarker);
+        if (!cancelSeen) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      assert.ok(cancelSeen, "socket death must fire session/cancel for the worker's session");
+
+      const status = await observer.request("broker/status", {});
+      assert.equal(status.busy, true, "an ignored cancel must leave the turn in flight");
+      assert.deepEqual(
+        status.activeSessions,
+        [workerSession.sessionId],
+        "broker/status must still name the session an ignored cancel left running"
+      );
+      await observer.close();
+    });
+  } finally {
+    if (previousCancelMarker === undefined) {
+      delete process.env.KIMI_FAKE_CANCEL_MARKER;
+    } else {
+      process.env.KIMI_FAKE_CANCEL_MARKER = previousCancelMarker;
+    }
+    if (previousSurviveDelay === undefined) {
+      delete process.env.KIMI_FAKE_SURVIVE_DELAY_MS;
+    } else {
+      process.env.KIMI_FAKE_SURVIVE_DELAY_MS = previousSurviveDelay;
+    }
+  }
+}
+
 // 9. Pipelined lines across interleaved chunks are parsed exactly once each
 // (regression for the async-data-handler buffer corruption).
 await withBroker("basic", async (session) => {

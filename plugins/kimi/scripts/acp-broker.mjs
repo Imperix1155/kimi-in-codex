@@ -78,6 +78,9 @@ async function main() {
   let activeSocket = null;
   let activeCount = 0;
   let shuttingDown = false;
+  // Reported by broker/status. The broker exits when its agent dies, so this
+  // is only ever observable false in the narrow window before that exit.
+  let agentAlive = true;
   const sockets = new Set();
   const disconnectedSockets = new WeakSet();
   // sessionId -> creating socket. A session's permission policy may only be
@@ -184,6 +187,24 @@ async function main() {
     // complete their handshake while a turn runs elsewhere.
     if (message.method === "initialize") {
       send(socket, { id: message.id, result: appClient.agentInfo ?? {} });
+      return;
+    }
+
+    // KMP-32: answered locally and BEFORE the busy gate, for the same reason
+    // initialize is. A cancel caller probes this to decide whether a turn is
+    // still in flight; behind the gate a busy broker would answer
+    // BROKER_BUSY and the caller would learn nothing about WHICH session is
+    // running — which is exactly the question. Read-only: it reports state
+    // and never reaches the agent, so answering it while busy is safe.
+    if (message.method === "broker/status") {
+      send(socket, {
+        id: message.id,
+        result: {
+          agentAlive,
+          busy: Boolean(activeSocket),
+          activeSessions: [...new Set(activeSessionBySocket.values())]
+        }
+      });
       return;
     }
 
@@ -326,6 +347,7 @@ async function main() {
   // A broker without its agent is useless and invisible-broken: exit so the
   // next companion call detects the dead endpoint and respawns cleanly.
   appClient.exitPromise.then(async () => {
+    agentAlive = false;
     if (shuttingDown) {
       return;
     }
