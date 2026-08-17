@@ -25,6 +25,28 @@ assert.equal(marketplace.name, "imperix");
 assert.equal(marketplace.plugins.length, 1);
 assert.deepEqual(marketplace.plugins[0].source, { source: "local", path: "./plugins/kimi" });
 
+// The repository's public and maintainer documents must describe the same
+// deliberately narrow task surface that the native manifest exposes.
+const readme = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
+const agents = fs.readFileSync(path.join(repoRoot, "AGENTS.md"), "utf8");
+const buildPlan = fs.readFileSync(path.join(repoRoot, "docs", "PLAN.md"), "utf8");
+const roadmap = fs.readFileSync(path.join(repoRoot, "docs", "ROADMAP.md"), "utf8");
+for (const document of [readme, agents, buildPlan]) {
+  assert.match(document, /\$kimi-task/);
+  assert.match(document, /foreground(?:-only)?/i);
+  assert.match(document, /default.*read-only|read-only.*default/i);
+  assert.match(document, /normal user filesystem authority/i);
+  assert.match(document, /not (?:an )?OS sandbox/i);
+  assert.match(document, /exact(?:-session)?(?:-only)? resume|exact session ID/i);
+  assert.match(document, /background.*durable.*deferred|durable.*background.*deferred/i);
+  assert.match(document, /rescue.*deferred|deferred.*rescue/i);
+}
+assert.match(agents, /plugins\/kimi\/skills\/kimi-task/);
+assert.match(roadmap, /- \[ \] \*\*KMP-30\*\*/);
+assert.match(roadmap, /Phase 5 acceptance gate \(pending\)/);
+assert.match(roadmap, /stale fake broker\/agent processes.*b37c/i);
+assert.match(roadmap, /exact-head full suites/i);
+
 const skillPath = path.join(pluginRoot, "skills", "kimi-setup", "SKILL.md");
 assert.ok(fs.existsSync(skillPath), "kimi-setup skill must exist");
 const skill = fs.readFileSync(skillPath, "utf8");

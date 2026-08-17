@@ -59,7 +59,8 @@
 
 - [x] **KMP-28** ✅ 2026-08-15 — created an independent `kimi-in-codex` history copy; source remote is fetch-only locally; public target repository created; full-history gitleaks scan clean before publication.
 - [x] **KMP-29** ✅ 2026-08-15 — native Codex package walking slice: repo marketplace, `.codex-plugin/plugin.json`, `$kimi-setup`, focused package test, and retained engine at `plugins/kimi`.
-- [ ] **KMP-30** Port and verify Codex-native task delegation, including write/read-only policy and resume semantics.
+- [ ] **KMP-30** Port and verify Codex-native task delegation, including write/read-only policy and resume semantics. The implemented surface is one foreground `$kimi-task`: default read-only, explicit write with normal user filesystem authority (not an OS sandbox), and exact-session-only resume. Background/durable lifecycle and rescue remain deferred.
+  - **Phase 5 acceptance gate (pending):** before final acceptance, explicitly clean stale fake broker/agent processes from worktree `b37c`, then rerun the exact-head full suites. Record the cleanup evidence, all eight deterministic sentinels, mutation checks, validators, and live canaries before checking KMP-30; do not silently treat this gate as green.
 - [x] **KMP-31** ✅ 2026-08-15 — native frozen adversarial review: caller supplies one UTF-8 diff artifact plus SHA-256; runtime verifies the retained bytes before Kimi starts, inlines exactly that snapshot, isolates the read-only ACP session from the live checkout, schema-validates findings, and returns hash/byte provenance. Every evidence/runtime/structure failure is explicit `NOT REVIEWED`; mutable and background review orchestration remain deferred.
 - [ ] **KMP-32** Port and verify status, result, cancellation, and background-job recovery.
 - [ ] **KMP-33** Decide and verify the Codex replacement for rescue-agent routing.

@@ -2,7 +2,7 @@
 
 This target repository ports the proven Kimi/ACP engine from the separate Claude Code repository into a native Codex plugin. The original repository remains the working Claude fallback and is not edited by this port.
 
-Status: **Codex setup and frozen-review slices implemented; broader Codex behaviors deferred.** The historical M1–M4 sections below document the already-proven engine, not Codex wrapper equivalence.
+Status: **Codex setup, frozen-review, and one foreground task slices implemented; broader Codex behaviors deferred.** The historical M1–M4 sections below document the already-proven engine, not Codex wrapper equivalence.
 
 ## 0. Codex port boundary (2026-08-15)
 
@@ -12,8 +12,11 @@ Native Codex surface:
 - `plugins/kimi/.codex-plugin/plugin.json` advertises bundled skills only.
 - `plugins/kimi/skills/kimi-setup` invokes the retained setup probe through the plugin root.
 - `plugins/kimi/skills/kimi-review` invokes foreground review only with a caller-supplied UTF-8 diff artifact and its verified SHA-256. It requests one narrowly elevated Codex runtime call for the existing authenticated Kimi home/log state and model connection, with no sandbox-first or fallback invocation. Elevation gives the process normal user filesystem authority rather than OS-level confinement; the implemented read-only boundary is the empty temporary ACP session cwd plus reject-only ACP permission handling. The runtime returns ledger-ready hash/byte provenance and exposes bounded, sanitized broker startup evidence on `NOT REVIEWED`.
+- `plugins/kimi/skills/kimi-task` exposes `$kimi-task` for one foreground task only. It defaults to read-only ACP permission rejection; write requires explicit user edit intent or selection and grants Kimi normal user filesystem write authority, not an OS sandbox. It starts fresh by default and may resume only the exact session ID returned by a successful current-conversation task. Its status, result, and cancellation are terminal properties of that current call only.
 
-Deferred until independently implemented and verified: task; automatic freezing and coverage-ledger orchestration; mutable working-tree/branch and background review flows; status, result, cancel, rescue, hooks, Codex data naming, and the MCP wrapper. Claude command/agent/hook files remain migration source material and are not advertised by the Codex manifest.
+Deferred until independently implemented and verified: automatic freezing and coverage-ledger orchestration; mutable working-tree/branch review; background and durable task lifecycle, status, result, and cancel workflows remain deferred. Rescue workflows remain deferred. Hooks, Codex data naming, and the MCP wrapper also remain deferred. Claude command/agent/hook files remain migration source material and are not advertised by the Codex manifest.
+
+Final acceptance remains pending: before KMP-30 can close, Phase 5 must explicitly clean stale fake broker/agent processes from worktree `b37c`, then rerun the exact-head full suites, mutation checks, validators, and live canaries. Do not treat this documentation update as verification evidence.
 
 ---
 
@@ -61,7 +64,7 @@ kimi-in-codex/                     (independent history copy; NOTICE preserved)
     ├── schemas/review-output.schema.json
     ├── commands/    review.md  task.md  status.md  result.md  cancel.md  setup.md  rescue.md
     ├── agents/      kimi-rescue.md
-    ├── skills/      kimi-setup/  kimi-review/  kimi-cli-runtime/  kimi-result-handling/
+    ├── skills/      kimi-setup/  kimi-review/  kimi-task/  kimi-cli-runtime/  kimi-result-handling/
     ├── prompts/     review.md  stop-review-gate.md
     ├── tests/       *.test.mjs + fixtures/fake-acp-agent.mjs   (plain-node suites)
     └── scripts/
