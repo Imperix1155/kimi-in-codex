@@ -1805,35 +1805,70 @@ function listLeakedTestProcesses() {
 }
 
 // Invariant C, the other direction: a cancel must never RELABEL a job that
-// finished on its own. The worker completes normally inside the confirmation
-// window, so "the session is gone" is true but is evidence of completion, not
-// of cancellation. Reproduced with a worker the cancel cannot signal (no
-// recorded pid), so the turn really does run to its own end.
+// SETTLED ON ITS OWN inside the confirmation window. Once the record is
+// terminal-and-not-cancelled, neither "the session is gone" nor an expired
+// window is evidence about the cancellation — writing either verdict would
+// destroy the user's recorded result.
+//
+// Deterministic by construction rather than by racing a real turn: the turn
+// is held open (so no probe can confirm), the worker is made unsignallable
+// (pid cleared), and the record is flipped to `completed` partway through
+// the cancel's confirmation window.
 {
-  const context = makeBackgroundWorkspace("slow-prompt-3s");
-  const launch = launchBackground(["a turn that finishes on its own"], context);
+  const context = makeBackgroundWorkspace("cancel-ignored");
+  const launch = launchBackground(["a turn that settles under the cancel"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const { jobId, claimToken } = launch.payload;
-  const running = await pollCodexJobStatus(jobId, ["running"], context, 15_000);
-  assert.ok(running, "job never reached running");
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
 
   const record = readCodexJobFile(jobId, context);
+  const workerPid = record.pid;
   writeCodexJobFile(jobId, { ...record, status: "running", phase: "running", pid: null }, context);
 
-  const cancel = runCli(["cancel", "--codex-job", jobId, "--json"], context);
-  const payload = JSON.parse(cancel.stdout);
-  assert.notEqual(
-    payload.cancelStatus,
-    "CANCELLED",
-    `a job that completed on its own must not be relabelled cancelled: ${cancel.stdout}`
+  const cancelChild = spawn(process.execPath, [CLI, "cancel", "--codex-job", jobId, "--json"], {
+    env: context.env,
+    cwd: context.cwd,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let cancelStdout = "";
+  cancelChild.stdout.setEncoding("utf8");
+  cancelChild.stdout.on("data", (chunk) => { cancelStdout += chunk; });
+  const cancelExit = new Promise((resolve) => cancelChild.on("exit", (code) => resolve(code)));
+
+  // Mid-window: the worker records a normal completion, exactly as it would
+  // have had the turn ended a moment after the cancel was requested.
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  writeCodexJobFile(
+    jobId,
+    {
+      ...record,
+      status: "completed",
+      phase: "done",
+      pid: null,
+      completedAt: new Date().toISOString(),
+      result: { status: 0, stopReason: "end_turn", sessionId: "sess-1", rawOutput: "SETTLED-ON-ITS-OWN" },
+      rendered: "SETTLED-ON-ITS-OWN\n"
+    },
+    context
   );
-  assert.equal(payload.status, "completed");
+  await cancelExit;
+
+  const payload = JSON.parse(cancelStdout);
+  assert.notEqual(payload.cancelStatus, "CANCELLED", `a settled job must not be relabelled cancelled: ${cancelStdout}`);
+  assert.equal(payload.status, "completed", `a settled job's state must be reported as-is: ${cancelStdout}`);
 
   const after = codexStatus(jobId, context);
-  assert.equal(after.payload.job.status, "completed", "the finished job's recorded state must survive the cancel");
+  assert.equal(after.payload.job.status, "completed", "the settled job's recorded state must survive the cancel");
   const result = runCli(["result", "--codex-job", jobId, "--claim", claimToken, "--json"], context);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(JSON.parse(result.stdout).result.rawOutput, /slow done/, "the user's result must not be destroyed");
+  assert.match(JSON.parse(result.stdout).result.rawOutput, /SETTLED-ON-ITS-OWN/, "the user's result must not be destroyed");
+
+  // The held turn's worker is still alive by design here; reap it explicitly.
+  if (Number.isFinite(workerPid)) {
+    try {
+      process.kill(workerPid, "SIGKILL");
+    } catch {}
+  }
   shutdownBroker(context.env, context.cwd);
 }
 
