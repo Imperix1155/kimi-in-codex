@@ -415,6 +415,102 @@ function pathToImport(relative) {
   shutdownBroker(env, cwd);
 }
 
+// 7f. Codex foreground one-shot tasks are read-only by default, return a
+// terminal taskStatus envelope, preserve prompt-file bytes, and never create
+// a durable task record. This fails if the one-shot path starts using the
+// legacy tracked-job flow or accidentally grants write permission.
+{
+  const { cwd, env } = makeWorkspace("permission-standard");
+  const before = JSON.parse(runCli(["status", "--json", "--all"], { env, cwd }).stdout);
+  const run = runCli([
+    "task", "--codex-once", "--json", "one-shot read-only task"
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const payload = JSON.parse(run.stdout);
+  assert.equal(payload.taskStatus, "COMPLETED");
+  assert.equal(payload.sessionId, "sess-1");
+  assert.equal(payload.permissionEvents[0].decision, "reject");
+  const after = JSON.parse(runCli(["status", "--json", "--all"], { env, cwd }).stdout);
+  assert.deepEqual(after.running, before.running);
+  assert.deepEqual(after.latestFinished, before.latestFinished);
+  assert.deepEqual(after.recent, before.recent);
+  shutdownBroker(env, cwd);
+}
+{
+  const { cwd, env } = makeWorkspace("prompt-echo");
+  const prompt = 'line one\n"quoted" \\backslash --write\nline three';
+  const promptFile = path.join(cwd, "one-shot-prompt.txt");
+  fs.writeFileSync(promptFile, prompt, "utf8");
+  const run = runCli([
+    "task", "--codex-once", "--json", "--prompt-file", promptFile
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const echoed = JSON.parse(run.stdout).rawOutput.slice("PROMPT-ECHO:".length);
+  const userPromptOffset = echoed.indexOf(prompt);
+  assert.ok(userPromptOffset > 0, "read-only preamble must precede the prompt-file content");
+  assert.equal(echoed.slice(userPromptOffset), prompt, "prompt-file bytes must reach Kimi unchanged after the preamble");
+  shutdownBroker(env, cwd);
+}
+
+// 7g. One-shot write and model selections flow through the same foreground
+// session, but only an explicit --write may select an allow permission.
+{
+  const { cwd, env } = makeWorkspace("permission-standard");
+  const run = runCli([
+    "task", "--codex-once", "--write", "--json", "edit exactly this file"
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const payload = JSON.parse(run.stdout);
+  assert.equal(payload.taskStatus, "COMPLETED");
+  assert.equal(payload.permissionEvents[0].decision, "allow");
+  shutdownBroker(env, cwd);
+}
+{
+  const { cwd, env } = makeWorkspace("model-check");
+  const run = runCli([
+    "task", "--codex-once", "--model", "highspeed", "--json", "use the selected model"
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const payload = JSON.parse(run.stdout);
+  assert.equal(payload.taskStatus, "COMPLETED");
+  assert.match(payload.rawOutput, /model:kimi-code\/kimi-for-coding-highspeed,thinking/);
+  shutdownBroker(env, cwd);
+}
+
+// 7h. One-shot resume is exact-session-only. It must reuse the session id
+// returned by the fresh task and reject legacy repository-history selectors.
+{
+  const { cwd, env } = makeWorkspace("resume-check");
+  const fresh = runCli([
+    "task", "--codex-once", "--fresh", "--json", "start the exact session"
+  ], { env, cwd });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const firstPayload = JSON.parse(fresh.stdout);
+  assert.equal(firstPayload.taskStatus, "COMPLETED");
+  assert.match(firstPayload.rawOutput, /fresh-session/);
+
+  const resumed = runCli([
+    "task", "--codex-once", "--resume-session", firstPayload.sessionId, "--json"
+  ], { env, cwd });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const resumedPayload = JSON.parse(resumed.stdout);
+  assert.equal(resumedPayload.taskStatus, "COMPLETED");
+  assert.equal(resumedPayload.sessionId, firstPayload.sessionId);
+  assert.match(resumedPayload.rawOutput, /resumed-session/);
+
+  for (const args of [
+    ["--codex-once", "--background", "x"],
+    ["--codex-once", "--resume-last"],
+    ["--codex-once", "--resume"],
+    ["--codex-once", "--fresh", "--resume-session", "sess-1", "x"]
+  ]) {
+    const invalid = runCli(["task", "--json", ...args], { env, cwd });
+    assert.notEqual(invalid.status, 0, `one-shot arguments must fail: ${args.join(" ")}`);
+    assert.equal(JSON.parse(invalid.stdout).taskStatus, "FAILED");
+  }
+  shutdownBroker(env, cwd);
+}
+
 // 8. Externally killed worker: status must reconcile the record to failed
 // instead of reporting "running" forever, and cancel must then refuse.
 {

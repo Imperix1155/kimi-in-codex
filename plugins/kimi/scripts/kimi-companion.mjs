@@ -85,6 +85,7 @@ function printUsage() {
       "Usage:",
       "  node <plugin-root>/scripts/kimi-companion.mjs review --diff-file <path> --diff-sha256 <64-hex> [--wait] [--model <id|highspeed|k3>] [focus text]",
       "  node <plugin-root>/scripts/kimi-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <id|highspeed|k3>] [focus text]  # legacy live-Git mode",
+      "  node <plugin-root>/scripts/kimi-companion.mjs task --codex-once --json [--write|--read-only] [--fresh|--resume-session <id>] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
       "  node <plugin-root>/scripts/kimi-companion.mjs task [--background] [--write|--read-only] [--resume-last|--resume|--fresh] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
       "  node <plugin-root>/scripts/kimi-companion.mjs status [job-id] [--all] [--wait] [--json]",
       "  node <plugin-root>/scripts/kimi-companion.mjs result [job-id] [--json]",
@@ -669,6 +670,27 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
+function classifyTaskExecution(execution) {
+  if (execution.cancelled) {
+    return "CANCELLED";
+  }
+  return execution.exitStatus === 0 ? "COMPLETED" : "FAILED";
+}
+
+async function runCodexOneShotTask(request) {
+  const progress = createProgressReporter({ stderr: true });
+  const execution = await executeTaskRun({ ...request, onProgress: progress });
+  const payload = {
+    taskStatus: classifyTaskExecution(execution),
+    ...execution.payload
+  };
+  outputResult(payload, true);
+  if (execution.exitStatus !== 0) {
+    process.exitCode = execution.exitStatus;
+  }
+  return execution;
+}
+
 function spawnDetachedTaskWorker(cwd, jobId) {
   const child = spawn(process.execPath, [SCRIPT_PATH, "task-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
@@ -726,8 +748,8 @@ function readTaskPrompt(cwd, options, positionals) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "prompt-file", "model", "effort"],
-    booleanOptions: ["json", "write", "read-only", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["cwd", "prompt-file", "model", "effort", "resume-session"],
+    booleanOptions: ["json", "write", "read-only", "resume-last", "resume", "fresh", "background", "codex-once"],
     aliasMap: {
       m: "model"
     }
@@ -739,11 +761,29 @@ async function handleTask(argv) {
   const model = resolveRequestedModel(options.model);
 
   const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
+  const codexOnce = Boolean(options["codex-once"]);
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
+  const resumeSessionId = options["resume-session"] == null
+    ? null
+    : String(options["resume-session"]).trim();
+  if (codexOnce && options.background) {
+    throw new Error("Codex one-shot tasks do not support --background; durable jobs remain deferred.");
+  }
+  if (codexOnce && resumeLast) {
+    throw new Error("Codex one-shot resume requires --resume-session <exact-session-id>.");
+  }
+  if (resumeSessionId && fresh) {
+    throw new Error("Choose either --fresh or --resume-session.");
+  }
+  if (Object.hasOwn(options, "resume-session") && !resumeSessionId) {
+    throw new Error("--resume-session requires a non-empty ACP session id.");
+  }
+  if (!codexOnce && resumeSessionId) {
+    throw new Error("--resume-session is available only with --codex-once.");
+  }
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
@@ -751,21 +791,35 @@ async function handleTask(argv) {
   // is auto-approve); --read-only is the explicit escape hatch and always
   // wins so a caller can never be surprised into a write-enabled run.
   const write = Boolean(options.write) && !options["read-only"];
-  if (!prompt && !resumeLast) {
+  if (!prompt && !resumeLast && !resumeSessionId) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
+
+  if (codexOnce) {
+    await runCodexOneShotTask({
+      cwd,
+      prompt,
+      write,
+      model,
+      resumeLast: Boolean(resumeSessionId),
+      resumeSessionId
+    });
+    return;
+  }
+
+  const workspaceRoot = resolveCommandWorkspace(options);
   const taskMetadata = buildTaskRunMetadata({ prompt, resumeLast });
   const job = buildTaskJob(workspaceRoot, taskMetadata, write);
 
-  let resumeSessionId = null;
+  let trackedResumeSessionId = null;
   if (resumeLast) {
-    resumeSessionId = resolveLatestTrackedTaskSession(workspaceRoot, { excludeJobId: job.id });
-    if (!resumeSessionId) {
+    trackedResumeSessionId = resolveLatestTrackedTaskSession(workspaceRoot, { excludeJobId: job.id });
+    if (!trackedResumeSessionId) {
       throw new Error("No previous Kimi task session was found for this repository.");
     }
   }
 
-  const request = { cwd, prompt, write, model, resumeLast, resumeSessionId, jobId: job.id };
+  const request = { cwd, prompt, write, model, resumeLast, resumeSessionId: trackedResumeSessionId, jobId: job.id };
 
   if (options.background) {
     ensureKimiAvailable(cwd);
@@ -1069,6 +1123,10 @@ function hasFrozenReviewIntent(argv) {
   );
 }
 
+function hasCodexOneShotIntent(argv) {
+  return argv[0] === "task" && argv.some((arg) => arg === "--codex-once" || arg.startsWith("--codex-once="));
+}
+
 function normalizeProcessCommandArgv(argv) {
   const [subcommand, ...commandArgv] = argv;
   return subcommand ? [subcommand, ...normalizeArgv(commandArgv)] : [];
@@ -1088,6 +1146,12 @@ main().catch((error) => {
       console.log(JSON.stringify({ reviewStatus: "NOT REVIEWED", error: message, ...details }, null, 2));
     }
     process.stderr.write(`NOT REVIEWED: ${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (hasCodexOneShotIntent(normalizedArgv) && jsonOutput) {
+    console.log(JSON.stringify({ taskStatus: "FAILED", error: message }, null, 2));
+    process.stderr.write(`${message}\n`);
     process.exitCode = 1;
     return;
   }
