@@ -553,6 +553,7 @@ async function executeTaskRun(request) {
       write: request.write,
       model: request.model ?? null,
       resumeSessionId,
+      preservePromptWhitespace: Boolean(request.preservePromptWhitespace),
       onProgress: request.onProgress
     });
   } catch (error) {
@@ -802,7 +803,8 @@ async function handleTask(argv) {
       write,
       model,
       resumeLast: Boolean(resumeSessionId),
-      resumeSessionId
+      resumeSessionId,
+      preservePromptWhitespace: true
     });
     return;
   }

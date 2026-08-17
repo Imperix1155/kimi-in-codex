@@ -652,7 +652,9 @@ export async function runKimiTurn(cwd, options = {}) {
       emitProgress(options.onProgress, `Model set (${options.model}).`, "starting");
     }
 
-    const basePrompt = options.prompt?.trim() || options.defaultPrompt || "";
+    const basePrompt = options.preservePromptWhitespace && options.prompt
+      ? options.prompt
+      : options.prompt?.trim() || options.defaultPrompt || "";
     if (!basePrompt) {
       throw new Error("A prompt is required for this Kimi run.");
     }

@@ -438,7 +438,7 @@ function pathToImport(relative) {
 }
 {
   const { cwd, env } = makeWorkspace("prompt-echo");
-  const prompt = 'line one\n"quoted" \\backslash --write\nline three';
+  const prompt = '\n  leading-space\n"quoted" \\backslash --write\ntrailing-space  \n';
   const promptFile = path.join(cwd, "one-shot-prompt.txt");
   fs.writeFileSync(promptFile, prompt, "utf8");
   const run = runCli([
@@ -446,9 +446,8 @@ function pathToImport(relative) {
   ], { env, cwd });
   assert.equal(run.status, 0, run.stderr);
   const echoed = JSON.parse(run.stdout).rawOutput.slice("PROMPT-ECHO:".length);
-  const userPromptOffset = echoed.indexOf(prompt);
-  assert.ok(userPromptOffset > 0, "read-only preamble must precede the prompt-file content");
-  assert.equal(echoed.slice(userPromptOffset), prompt, "prompt-file bytes must reach Kimi unchanged after the preamble");
+  assert.match(echoed, /READ-ONLY task/, "read-only preamble must precede the prompt-file content");
+  assert.equal(echoed.slice(-prompt.length), prompt, "prompt-file boundary whitespace must reach Kimi unchanged after the preamble");
   shutdownBroker(env, cwd);
 }
 
