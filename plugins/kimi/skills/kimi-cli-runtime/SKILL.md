@@ -1,7 +1,6 @@
 ---
 name: kimi-cli-runtime
 description: Internal helper contract for calling the kimi-companion runtime from Claude Code
-user-invocable: false
 ---
 
 # Kimi Runtime
