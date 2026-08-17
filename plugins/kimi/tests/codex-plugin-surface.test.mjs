@@ -42,10 +42,12 @@ for (const document of [readme, agents, buildPlan]) {
   assert.match(document, /rescue.*deferred|deferred.*rescue/i);
 }
 assert.match(agents, /plugins\/kimi\/skills\/kimi-task/);
-assert.match(roadmap, /- \[ \] \*\*KMP-30\*\*/);
-assert.match(roadmap, /Phase 5 acceptance gate \(pending\)/);
+assert.match(roadmap, /- \[x\] \*\*KMP-30\*\* ✅ 2026-08-16/);
+assert.match(roadmap, /Phase 5 acceptance gate \(passed\)/);
 assert.match(roadmap, /stale fake broker\/agent processes.*b37c/i);
 assert.match(roadmap, /exact-head full suites/i);
+assert.match(roadmap, /c1f810bfdb4e740cf5e4c7c95d44bf659a57bb61/);
+assert.match(roadmap, /four live Kimi 1\.49 canaries/i);
 
 const skillPath = path.join(pluginRoot, "skills", "kimi-setup", "SKILL.md");
 assert.ok(fs.existsSync(skillPath), "kimi-setup skill must exist");
