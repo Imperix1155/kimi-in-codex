@@ -24,8 +24,6 @@ import {
   computeAuthoritySeal,
   computeTtlDeadline,
   currentBootId,
-  DEFAULT_TTL_MINUTES,
-  HARD_CEILING_TTL_MINUTES,
   hashClaimToken,
   isActiveCodexStatus,
   mintClaimToken,
