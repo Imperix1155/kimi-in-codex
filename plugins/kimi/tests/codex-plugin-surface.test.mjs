@@ -76,8 +76,40 @@ const reviewMetadata = fs.readFileSync(path.join(pluginRoot, "skills", "kimi-rev
 assert.match(reviewMetadata, /display_name: "Kimi Review"/);
 assert.match(reviewMetadata, /\$kimi-review/);
 
+const taskSkillPath = path.join(pluginRoot, "skills", "kimi-task", "SKILL.md");
+assert.ok(fs.existsSync(taskSkillPath), "kimi-task skill must exist");
+const taskSkill = fs.readFileSync(taskSkillPath, "utf8");
+const taskFrontmatter = taskSkill.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
+assert.deepEqual(
+  taskFrontmatter.split("\n").map((line) => line.split(":", 1)[0]),
+  ["name", "description"],
+  "task skill frontmatter must contain only name and description"
+);
+assert.match(taskSkill, /task --codex-once --json/);
+assert.equal(
+  taskSkill.match(/node "\$\{PLUGIN_ROOT\}\/scripts\/kimi-companion\.mjs" task/g)?.length,
+  1,
+  "task skill must invoke the runtime exactly once"
+);
+assert.match(taskSkill, /sandbox_permissions:\s*["`]require_escalated["`]/);
+assert.match(taskSkill, /default.*read-only/i);
+assert.match(taskSkill, /normal user filesystem authority/i);
+assert.match(taskSkill, /not (?:an )?OS sandbox/i);
+assert.match(taskSkill, /--resume-session/);
+assert.match(taskSkill, /background.*not supported|not support.*background/i);
+assert.doesNotMatch(taskSkill, /\$kimi-status|\$kimi-result|\$kimi-cancel/);
+assert.doesNotMatch(taskSkill, /\$ARGUMENTS|AskUserQuestion|CLAUDE_PLUGIN_ROOT/);
+
+const taskMetadata = fs.readFileSync(path.join(pluginRoot, "skills", "kimi-task", "agents", "openai.yaml"), "utf8");
+assert.match(taskMetadata, /display_name: "Kimi Task"/);
+assert.match(taskMetadata, /\$kimi-task/);
+
 assert.match(manifest.description, /review/i);
+assert.match(manifest.description, /task handoff/i);
+assert.match(manifest.interface.defaultPrompt.join(" "), /task handoff/i);
 assert.match(manifest.interface.longDescription, /frozen/i);
-assert.match(manifest.interface.longDescription, /not included|not yet/i);
+assert.match(manifest.interface.longDescription, /background.*lifecycle.*not included/i);
+assert.ok(manifest.interface.capabilities.includes("Read"));
+assert.ok(manifest.interface.capabilities.includes("Write"));
 
 console.log("CODEX-PLUGIN-SURFACE-GREEN");

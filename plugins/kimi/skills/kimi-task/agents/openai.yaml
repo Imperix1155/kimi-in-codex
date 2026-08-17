@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kimi Task"
+  short_description: "Hand one foreground task to Kimi"
+  default_prompt: "Use $kimi-task to hand this task to Kimi in read-only mode."
