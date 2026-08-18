@@ -12,7 +12,15 @@ import {
   TTL_SELF_ABORT_MESSAGE
 } from "./codex-jobs.mjs";
 import { getSessionRuntimeStatus } from "./kimi.mjs";
-import { getConfig, listJobs, patchJobUnderLock, readJobFile, resolveJobFile, upsertJob } from "./state.mjs";
+import {
+  getConfig,
+  listJobs,
+  patchJobUnderLock,
+  readJobFile,
+  resolveJobFile,
+  StateLockUnavailableError,
+  upsertJob
+} from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -88,12 +96,25 @@ function markCodexJobTerminal(workspaceRoot, job, status, errorMessage, { abortI
     errorMessage,
     completedAt
   };
-  return patchJobUnderLock(workspaceRoot, job.id, ({ stored, indexed }) => {
-    if (abortIfSettled && settledCodexJobStatus(stored, indexed)) {
-      return null;
+  try {
+    return patchJobUnderLock(workspaceRoot, job.id, ({ stored, indexed }) => {
+      if (abortIfSettled && settledCodexJobStatus(stored, indexed)) {
+        return null;
+      }
+      return patch;
+    }).applied;
+  } catch (error) {
+    // Reconciliation is OPPORTUNISTIC — "any reader enforces the deadline" —
+    // and every read path runs it (buildStatusSnapshot, resolveResultJob,
+    // resolveCancelableJob, the legacy Claude surface included). A contended
+    // lock means leave the write for the next reader, never break the reader
+    // that happened to arrive during the contention. A caller that is
+    // COMMITTING a decision (launch, cancel) still lets the error propagate.
+    if (error instanceof StateLockUnavailableError) {
+      return false;
     }
-    return patch;
-  }).applied;
+    throw error;
+  }
 }
 
 // TTL self-abort attribution (§14 Q2): a worker whose own deadline timer

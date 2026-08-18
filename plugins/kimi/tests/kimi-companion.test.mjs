@@ -1744,17 +1744,48 @@ function listLeakedTestProcesses() {
       const outcome = {};
       try {
         state.patchJobUnderLock(workspaceRoot, seeded.id, () => ({ status: "cancelled" }));
-        outcome.patch = "APPLIED WITHOUT THE LOCK";
+        outcome.patch = "APPLIED-UNSYNCHRONIZED";
       } catch (error) {
         outcome.patch = error.message;
       }
       try {
         state.insertJobUnderLock(workspaceRoot, { id: "task-locked1-bbbbbb", status: "queued" }, () => null);
-        outcome.insert = "INSERTED WITHOUT THE LOCK";
+        outcome.insert = "INSERTED-UNSYNCHRONIZED";
       } catch (error) {
         outcome.insert = error.message;
       }
+
+      // ...but a READ must still work. Reconciliation is opportunistic and
+      // runs on every read path — buildStatusSnapshot, resolveResultJob,
+      // resolveCancelableJob, the legacy Claude surface included — so a
+      // contended lock has to mean "leave the write for the next reader", not
+      // "break the reader that arrived during the contention".
+      const jobControl = await import(process.argv[3]);
+      const codex = await import(process.argv[4]);
+      const reconcilable = {
+        id: "task-locked2-cccccc",
+        codexBackground: true,
+        status: "running",
+        phase: "running",
+        pid: 999999,
+        write: false,
+        workspaceRoot,
+        bootId: codex.currentBootId(),
+        ttlDeadline: new Date(Date.now() - 1000).toISOString()
+      };
+      state.writeJobFile(workspaceRoot, reconcilable.id, reconcilable);
+      state.upsertJob(workspaceRoot, reconcilable);
+      fs.mkdirSync(lockDir, { recursive: true });
+      fs.utimesSync(lockDir, future, future);
+      try {
+        jobControl.reconcileActiveJobs(workspaceRoot, { isProcessAliveImpl: () => false });
+        outcome.readSurvived = true;
+      } catch (error) {
+        outcome.readSurvived = "THREW: " + error.message;
+      }
       fs.rmdirSync(lockDir);
+      outcome.reconcilableStatus =
+        state.listJobs(workspaceRoot).find((job) => job.id === reconcilable.id)?.status ?? null;
       outcome.storedStatus = state.readJobFile(state.resolveJobFile(workspaceRoot, seeded.id)).status;
       outcome.inserted = state.listJobs(workspaceRoot).some((job) => job.id === "task-locked1-bbbbbb");
       process.stdout.write(JSON.stringify(outcome));
@@ -1762,7 +1793,14 @@ function listLeakedTestProcesses() {
   `;
   const probe = spawnSync(
     process.execPath,
-    ["-e", probeScript, context.cwd, pathToImport("../scripts/lib/state.mjs")],
+    [
+      "-e",
+      probeScript,
+      context.cwd,
+      pathToImport("../scripts/lib/state.mjs"),
+      pathToImport("../scripts/lib/job-control.mjs"),
+      pathToImport("../scripts/lib/codex-jobs.mjs")
+    ],
     { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 30_000 }
   );
   assert.equal(probe.status, 0, `lock-contention probe failed: ${probe.stderr}`);
@@ -1772,6 +1810,50 @@ function listLeakedTestProcesses() {
   assert.match(locked.insert, /lock/i, `insertJobUnderLock must refuse without the lock: ${locked.insert}`);
   assert.equal(locked.storedStatus, "running", "a refused patch must not have written anything");
   assert.equal(locked.inserted, false, "a refused insert must not have written anything");
+  assert.equal(locked.readSurvived, true, `a READ must survive a contended lock: ${locked.readSurvived}`);
+  assert.equal(
+    locked.reconcilableStatus,
+    "running",
+    "the deferred terminal write must be left for the next reader, not half-applied"
+  );
+
+  // And the same contract through the real CLI: reads answer, writes refuse.
+  const poison = (jobId) => {
+    const script = `
+      (async () => {
+        const fs = await import("node:fs");
+        const path = await import("node:path");
+        const state = await import(process.argv[2]);
+        const lockDir = path.join(path.dirname(path.dirname(state.resolveJobFile(process.argv[1], process.argv[3]))), "state.lock");
+        fs.mkdirSync(lockDir, { recursive: true });
+        const future = new Date(Date.now() + 3600000);
+        fs.utimesSync(lockDir, future, future);
+      })();
+    `;
+    spawnSync(process.execPath, ["-e", script, context.cwd, pathToImport("../scripts/lib/state.mjs"), jobId], {
+      env: context.env,
+      cwd: context.cwd,
+      encoding: "utf8",
+      timeout: 10_000
+    });
+  };
+  const contendedLaunch = launchBackground(["a launch that cannot take the lock"], context);
+  assert.equal(contendedLaunch.status, 0, contendedLaunch.stderr);
+  const contendedJobId = contendedLaunch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(contendedJobId, ["completed"], context), "seed job never completed");
+  shutdownBroker(context.env, context.cwd);
+  poison(contendedJobId);
+  const readUnderLock = runCli(["status", "--codex-jobs", "--json"], context);
+  assert.equal(readUnderLock.status, 0, `a status read must survive a contended lock: ${readUnderLock.stderr}`);
+  const legacyReadUnderLock = runCli(["status"], context);
+  assert.equal(
+    legacyReadUnderLock.status,
+    0,
+    `the legacy status read must survive a contended lock: ${legacyReadUnderLock.stderr}`
+  );
+  const writeUnderLock = launchBackground(["a second launch under the held lock"], context);
+  assert.notEqual(writeUnderLock.status, 0, "a launch cannot commit its precondition without the lock");
+  assert.match(writeUnderLock.payload.error, /lock/i, writeUnderLock.stdout);
 }
 
 // §12 #7. Launch is refused outright under KIMI_COMPANION_AGENT_SPAWN: that
@@ -2353,9 +2435,12 @@ function listLeakedTestProcesses() {
   writeCodexJobFile(jobId, requeued, context);
 
   fs.rmSync(startMarker, { force: true });
-  const workerStartedAt = Date.now();
+  // Anchored to the SEALED value, not to a stopwatch started here: the write
+  // and the spawn between sealing and running cost real time on a loaded
+  // runner, and an elapsed-since-here oracle would silently absorb it.
+  const sealedDeadlineMs = Date.parse(requeued.ttlDeadline);
   const worker = runCli(["task-worker", "--job-id", jobId, "--cwd", context.cwd], context);
-  const workerElapsed = Date.now() - workerStartedAt;
+  const workerFinishedAt = Date.now();
   assert.notEqual(worker.status, 0, "a turn killed by its deadline is not a success");
 
   // Oracle 1: the agent actually started, so the broker came up and the
@@ -2365,10 +2450,11 @@ function listLeakedTestProcesses() {
     true,
     `the turn never started, so this run did not exercise the deadline path: ${worker.stderr}`
   );
-  // Oracle 2: the worker lived until its deadline rather than dying early.
+  // Oracle 2: the worker was still alive AT its sealed deadline, so the timer
+  // is what ended it — not a startup failure that happened to exit nonzero.
   assert.ok(
-    workerElapsed >= ttlMarginMs * 0.8,
-    `the worker exited after ${workerElapsed}ms, well before its ${ttlMarginMs}ms deadline: ${worker.stderr}`
+    workerFinishedAt >= sealedDeadlineMs,
+    `the worker exited ${sealedDeadlineMs - workerFinishedAt}ms BEFORE its sealed deadline, so the timer did not end it: ${worker.stderr}`
   );
 
   const settled = readCodexJobFile(jobId, context);

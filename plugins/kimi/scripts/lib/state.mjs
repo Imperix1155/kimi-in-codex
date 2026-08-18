@@ -331,12 +331,23 @@ export function listJobs(cwd) {
 //
 // Deliberately NOT applied to saveState/updateState: the legacy Claude
 // surface runs through those, and its behaviour stays byte-identical.
+// Typed so an OPPORTUNISTIC caller can tell "another command holds the lock"
+// (leave it for the next reader) apart from a real failure it must not
+// swallow. Callers that are committing a decision — a launch, a cancel — let
+// it propagate.
+export class StateLockUnavailableError extends Error {
+  constructor() {
+    super(
+      "Could not acquire the Kimi job-state lock; another command is holding it. Nothing was changed — retry the operation."
+    );
+    this.name = "StateLockUnavailableError";
+  }
+}
+
 function requireStateLock(cwd) {
   const lock = acquireStateLock(cwd);
   if (!lock) {
-    throw new Error(
-      "Could not acquire the Kimi job-state lock; another command is holding it. Nothing was changed — retry the operation."
-    );
+    throw new StateLockUnavailableError();
   }
   return lock;
 }
