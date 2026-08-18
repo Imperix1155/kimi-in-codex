@@ -1888,6 +1888,68 @@ function listLeakedTestProcesses() {
   assert.equal(outcome.survivorRetained, true, "an ACTIVE job must never be pruned by MAX_JOBS");
 }
 
+// F3: the MAX_JOBS active-exemption is for live detached CODEX workers only.
+// Applying it to legacy Claude records too resurrects a zombie: a legacy
+// `queued` entry that can never go terminal (an async spawn failure leaves
+// pid null; after a reboot a recycled-alive pid reads as live, and the legacy
+// branch deliberately has no bootId check) used to age out at MAX_JOBS. Left
+// exempt it survives forever, and since findActiveWorkspaceJob scans ALL jobs
+// it then blocks every future background launch with no CLI recovery.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const probeScript = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      const workspaceRoot = process.argv[1];
+
+      // A legacy record: no codexBackground flag, permanently queued.
+      const zombie = {
+        id: "task-zzzzzzz-000001",
+        status: "queued",
+        phase: "queued",
+        pid: null,
+        write: false,
+        workspaceRoot,
+        updatedAt: "2020-01-01T00:00:00.000Z"
+      };
+      state.upsertJob(workspaceRoot, zombie);
+      state.updateState(workspaceRoot, (s) => {
+        s.jobs.find((job) => job.id === zombie.id).updatedAt = "2020-01-01T00:00:00.000Z";
+      });
+      for (let index = 0; index < 60; index += 1) {
+        state.upsertJob(workspaceRoot, {
+          id: \`task-fill\${index.toString(36).padStart(4, "0")}-dddddd\`,
+          status: "completed",
+          write: false,
+          workspaceRoot
+        });
+      }
+      process.stdout.write(JSON.stringify({
+        zombieSurvivedPrune: state.listJobs(workspaceRoot).some((job) => job.id === zombie.id)
+      }));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", probeScript, context.cwd, pathToImport("../scripts/lib/state.mjs")],
+    { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 20_000 }
+  );
+  assert.equal(probe.status, 0, `prune probe failed: ${probe.stderr}`);
+  assert.equal(
+    JSON.parse(probe.stdout).zombieSurvivedPrune,
+    false,
+    "a legacy active record must still age out of the index at MAX_JOBS"
+  );
+
+  // The consequence, end to end: a stale legacy record must not wedge the
+  // Codex background surface shut.
+  const launch = launchBackground(["launch past a legacy zombie"], context);
+  assert.equal(launch.status, 0, `a legacy zombie must not block a background launch: ${launch.stdout}`);
+  assert.equal(launch.payload.launchStatus, "QUEUED");
+  assert.ok(await pollCodexJobStatus(launch.payload.jobId, ["completed"], context), "launched job never completed");
+  shutdownBroker(context.env, context.cwd);
+}
+
 // §14 Q2 attribution: a TTL self-abort ends the turn as a graceful cancel,
 // but the record must say the DEADLINE did it, as `failed` — the label may
 // not depend on which enforcer (worker timer vs reconciler) won the race.

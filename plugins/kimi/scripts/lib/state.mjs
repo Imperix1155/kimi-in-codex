@@ -164,16 +164,22 @@ export function loadState(cwd) {
   }
 }
 
-// KMP-32: an ACTIVE job is never pruned, however old its index entry looks.
-// `updatedAt` is not a liveness proxy — createJobProgressUpdater upserts
-// only when the phase/threadId/turnId CHANGES, so a long quiet turn goes
-// stale in the index while its worker is still running. Pruning it would
+// KMP-32: an ACTIVE CODEX job is never pruned, however old its index entry
+// looks. `updatedAt` is not a liveness proxy — createJobProgressUpdater
+// upserts only when the phase/threadId/turnId CHANGES, so a long quiet turn
+// goes stale in the index while its worker is still running. Pruning it would
 // delete the record and log of a live detached process.
+//
+// The exemption is gated on codexBackground because legacy records have no
+// bootId check and no deadline: a legacy `queued` entry with a null or
+// recycled-alive pid can never go terminal, and exempting it too would keep
+// it forever — where findActiveWorkspaceJob, which scans ALL jobs, would then
+// refuse every background launch in the workspace with no way to clear it.
 function pruneJobs(jobs) {
   const sorted = [...jobs].sort((left, right) =>
     String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
   );
-  const active = sorted.filter((job) => isActiveCodexStatus(job.status));
+  const active = sorted.filter((job) => job.codexBackground && isActiveCodexStatus(job.status));
   const activeIds = new Set(active.map((job) => job.id));
   const retained = sorted.filter((job) => !activeIds.has(job.id)).slice(0, Math.max(0, MAX_JOBS - active.length));
   return sorted.filter((job) => activeIds.has(job.id) || retained.includes(job));
