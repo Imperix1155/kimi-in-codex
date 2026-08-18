@@ -1688,6 +1688,68 @@ function listLeakedTestProcesses() {
   assert.deepEqual(JSON.parse(list.stdout).jobs, [], "a refused launch must never create a record");
 }
 
+// The two lock helpers claim, in their own comments, that the decision and
+// the write share ONE lock hold. acquireStateLock gives up after ~2s and
+// returns null, and both helpers used to carry on regardless — running the
+// read-decide-write sequence completely unsynchronized at exactly the moment
+// contention proved another writer was there. That is the F1 corruption
+// window with the guard removed, so they fail closed instead.
+//
+// The lock is poisoned with a FUTURE mtime, which makes it un-reapable by the
+// staleness sweep: acquireStateLock exhausts its retries and returns null
+// deterministically, with no racing.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const probeScript = `
+    (async () => {
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      const state = await import(process.argv[2]);
+      const workspaceRoot = process.argv[1];
+
+      const seeded = { id: "task-locked0-aaaaaa", codexBackground: true, status: "running", write: false, workspaceRoot };
+      state.writeJobFile(workspaceRoot, seeded.id, seeded);
+      state.upsertJob(workspaceRoot, seeded);
+
+      const stateDir = path.dirname(state.resolveJobFile(workspaceRoot, seeded.id));
+      const lockDir = path.join(path.dirname(stateDir), "state.lock");
+      fs.mkdirSync(lockDir, { recursive: true });
+      const future = new Date(Date.now() + 3600000);
+      fs.utimesSync(lockDir, future, future);
+
+      const outcome = {};
+      try {
+        state.patchJobUnderLock(workspaceRoot, seeded.id, () => ({ status: "cancelled" }));
+        outcome.patch = "APPLIED WITHOUT THE LOCK";
+      } catch (error) {
+        outcome.patch = error.message;
+      }
+      try {
+        state.insertJobUnderLock(workspaceRoot, { id: "task-locked1-bbbbbb", status: "queued" }, () => null);
+        outcome.insert = "INSERTED WITHOUT THE LOCK";
+      } catch (error) {
+        outcome.insert = error.message;
+      }
+      fs.rmdirSync(lockDir);
+      outcome.storedStatus = state.readJobFile(state.resolveJobFile(workspaceRoot, seeded.id)).status;
+      outcome.inserted = state.listJobs(workspaceRoot).some((job) => job.id === "task-locked1-bbbbbb");
+      process.stdout.write(JSON.stringify(outcome));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", probeScript, context.cwd, pathToImport("../scripts/lib/state.mjs")],
+    { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 30_000 }
+  );
+  assert.equal(probe.status, 0, `lock-contention probe failed: ${probe.stderr}`);
+  const locked = JSON.parse(probe.stdout);
+  assert.match(locked.patch, /lock/i, `patchJobUnderLock must refuse without the lock: ${locked.patch}`);
+  assert.match(locked.patch, /retry/i, "the refusal must tell the caller the operation is retryable");
+  assert.match(locked.insert, /lock/i, `insertJobUnderLock must refuse without the lock: ${locked.insert}`);
+  assert.equal(locked.storedStatus, "running", "a refused patch must not have written anything");
+  assert.equal(locked.inserted, false, "a refused insert must not have written anything");
+}
+
 // §12 #7. Launch is refused outright under KIMI_COMPANION_AGENT_SPAWN: that
 // override makes availability unconditionally true, so a detached worker
 // could outlive the shell that set the seam.

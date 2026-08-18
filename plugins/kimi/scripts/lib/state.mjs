@@ -321,6 +321,26 @@ export function listJobs(cwd) {
 // They deliberately do not call upsertJob/saveState: those take the lock
 // themselves, and re-entering it would stall for the full 2s lock timeout.
 
+// These two helpers exist BECAUSE the decision and the write must share one
+// lock hold, so they may not fall back to the legacy proceed-unlocked
+// behaviour: acquireStateLock returns null only after ~2s of contention —
+// exactly the moment another writer is proven to be there — and carrying on
+// then would run the read-decide-write sequence with no synchronization at
+// all. Failing closed costs a retryable error; failing open costs a
+// clobbered record or a second concurrent launch.
+//
+// Deliberately NOT applied to saveState/updateState: the legacy Claude
+// surface runs through those, and its behaviour stays byte-identical.
+function requireStateLock(cwd) {
+  const lock = acquireStateLock(cwd);
+  if (!lock) {
+    throw new Error(
+      "Could not acquire the Kimi job-state lock; another command is holding it. Nothing was changed — retry the operation."
+    );
+  }
+  return lock;
+}
+
 function applyJobPatchUnlocked(state, jobId, patch) {
   const timestamp = nowIso();
   const existingIndex = state.jobs.findIndex((job) => job.id === jobId);
@@ -340,7 +360,7 @@ function applyJobPatchUnlocked(state, jobId, patch) {
 // to apply to BOTH, or null to abort the write. The pre-write view is
 // returned either way, so a caller that aborted can report what it saw.
 export function patchJobUnderLock(cwd, jobId, decide) {
-  const lock = acquireStateLock(cwd);
+  const lock = requireStateLock(cwd);
   try {
     const jobFile = resolveJobFile(cwd, jobId);
     const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
@@ -367,7 +387,7 @@ export function patchJobUnderLock(cwd, jobId, decide) {
 // null to commit `record`. The check and the insert share one lock hold, so
 // a second launch cannot pass the same precondition concurrently.
 export function insertJobUnderLock(cwd, record, decide) {
-  const lock = acquireStateLock(cwd);
+  const lock = requireStateLock(cwd);
   try {
     const state = loadState(cwd);
     const refusal = decide(state.jobs);
