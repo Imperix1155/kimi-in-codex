@@ -12,7 +12,24 @@ import process from "node:process";
 import { TextDecoder } from "node:util";
 import { fileURLToPath } from "node:url";
 
+import { AGENT_SPAWN_ENV } from "./lib/agent-profile.mjs";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
+import {
+  assertJobId,
+  assertSealedLaunchAuthority,
+  buildCodexJobMetadata,
+  buildResidualRiskMessage,
+  CANCEL_CONFIRM_POLL_MS,
+  CANCEL_CONFIRM_WINDOW_MS,
+  computeAuthoritySeal,
+  computeTtlDeadline,
+  currentBootId,
+  hashClaimToken,
+  isActiveCodexStatus,
+  mintClaimToken,
+  resolveTtlMinutes,
+  verifyClaimToken
+} from "./lib/codex-jobs.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, getCurrentBranch, resolveReviewTarget } from "./lib/git.mjs";
 import {
@@ -24,19 +41,36 @@ import {
   getSessionRuntimeStatus,
   isBrokerBusyError,
   parseStructuredOutput,
+  probeBrokerStatus,
   READ_ONLY_TASK_PREAMBLE,
   resolveRequestedModel,
   runKimiTurn
 } from "./lib/kimi.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
-import { generateJobId, getConfig, listJobs, setConfig, upsertJob, writeJobFile } from "./lib/state.mjs";
 import {
+  generateJobId,
+  getConfig,
+  insertJobUnderLock,
+  listJobs,
+  patchJobUnderLock,
+  setConfig,
+  upsertJob,
+  writeJobFile
+} from "./lib/state.mjs";
+import {
+  attributeTtlExpiry,
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  findActiveJob,
+  findActiveWorkspaceJob,
+  listCodexBackgroundJobs,
+  readJobProgressPreview,
   readStoredJob,
   resolveCancelableJob,
+  resolveCodexBackgroundJob,
   resolveResultJob,
+  settledCodexJobStatus,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
 import {
@@ -85,6 +119,10 @@ function printUsage() {
       "  node <plugin-root>/scripts/kimi-companion.mjs review --diff-file <path> --diff-sha256 <64-hex> [--wait] [--model <id|highspeed|k3>] [focus text]",
       "  node <plugin-root>/scripts/kimi-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <id|highspeed|k3>] [focus text]  # legacy live-Git mode",
       "  node <plugin-root>/scripts/kimi-companion.mjs task --codex-once --json [--write|--read-only] [--fresh|--resume-session <id>] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
+      "  node <plugin-root>/scripts/kimi-companion.mjs task --codex-background --json [--read-only] [--ttl-minutes <1-60>] [--model <id|highspeed|k3>] --prompt-file <path>",
+      "  node <plugin-root>/scripts/kimi-companion.mjs status --codex-job <exact-id> [--claim <token>] --json",
+      "  node <plugin-root>/scripts/kimi-companion.mjs result --codex-job <exact-id> --claim <token> --json",
+      "  node <plugin-root>/scripts/kimi-companion.mjs cancel --codex-job <exact-id> --json",
       "  node <plugin-root>/scripts/kimi-companion.mjs setup [--json]",
       "  node <plugin-root>/scripts/kimi-companion.mjs task [--background] [--write|--read-only] [--resume-last|--resume|--fresh] [--model <id|highspeed|k3>] [--prompt-file <path>] [prompt]",
       "  node <plugin-root>/scripts/kimi-companion.mjs status [job-id] [--all] [--wait] [--json]",
@@ -192,6 +230,14 @@ function findLatestResumableTaskJob(jobs) {
     jobs.find(
       (job) =>
         job.jobClass === "task" &&
+        // KMP-32: a Codex background record is NEVER a resume candidate. This
+        // path's session filter fails open with no KIMI_COMPANION_SESSION_ID,
+        // which is always the Codex case — so without this clause
+        // `task-resume-candidate` and `--resume-last` would hand out a
+        // background job's ACP sessionId with no claim token, reconstructing
+        // resume-by-history through the legacy surface. Legacy Claude records
+        // never carry the field, so their behavior is unchanged.
+        !job.codexBackground &&
         job.threadId &&
         job.status !== "queued" &&
         job.status !== "running"
@@ -757,6 +803,498 @@ function enqueueBackgroundTask(cwd, job, request) {
   };
 }
 
+// --- KMP-32: Codex background jobs -----------------------------------------
+
+// A detached worker holds the authority of a grant whose consent affordance
+// has already closed, so it starts from a CURATED environment rather than
+// inheriting the launching shell's. Notably absent: the agent-spawn test
+// seam, a pre-resolved broker endpoint, and the Claude session id.
+function buildCuratedWorkerEnv(env = process.env) {
+  const curated = {};
+  for (const key of [
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SystemRoot",
+    "USERPROFILE",
+    "APPDATA",
+    "TEMP",
+    "TMP"
+  ]) {
+    if (env[key] != null) {
+      curated[key] = env[key];
+    }
+  }
+  // The worker MUST resolve the same state dir as its launcher or the job
+  // stays queued forever in a directory nobody reads.
+  const dataDir = env.KIMI_COMPANION_DATA || env.CLAUDE_PLUGIN_DATA;
+  if (dataDir) {
+    curated.KIMI_COMPANION_DATA = dataDir;
+  }
+  return curated;
+}
+
+function spawnDetachedCodexWorker(cwd, jobId) {
+  const child = spawn(process.execPath, [SCRIPT_PATH, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+    cwd,
+    env: buildCuratedWorkerEnv(),
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  child.unref();
+  return child;
+}
+
+function assertCodexBackgroundLaunchAllowed({ write, resumeLast, workspaceRoot }) {
+  // §6 mitigation 3: under the spawn override getKimiAvailability returns
+  // available unconditionally, so a detached worker would outlive the shell
+  // that set the seam — with no way to reason about what it is even talking
+  // to. Refuse the launch outright rather than sanitize around it.
+  if (process.env[AGENT_SPAWN_ENV]) {
+    throw new Error(
+      `Background launch is refused while ${AGENT_SPAWN_ENV} is set: a detached worker must never outlive the shell that installed an agent override. Unset it and relaunch.`
+    );
+  }
+  // Owner decision Q1 (2026-08-17): read-only background only this phase.
+  if (write) {
+    throw new Error(
+      "Background Kimi jobs are sealed read-only. Write-enabled background execution is a deliberate separate decision that has not been taken; use `task --codex-once --write` for a foreground write task you supervise."
+    );
+  }
+  // Invariant B: resume-by-history is banned on the Codex surface.
+  if (resumeLast) {
+    throw new Error(
+      "--resume-last and --resume are not available on the Codex surface. Background launch accepts --resume-session <exact-session-id> only."
+    );
+  }
+  // §4: the broker serializes turns, so a second background job would fail
+  // at session/new. Make it an explicit precondition, not emergent behavior.
+  // This is the RECONCILING check — it also gives the caller a useful refusal
+  // before a token is minted. The binding one runs inside the insert's lock.
+  const active = findActiveWorkspaceJob(workspaceRoot);
+  if (active) {
+    throw new Error(buildSingleActiveJobRefusal(active));
+  }
+}
+
+function buildSingleActiveJobRefusal(active) {
+  return `Kimi job ${active.id} is already ${active.status} in this workspace. At most one background job runs at a time - check its status, or cancel it before launching another.`;
+}
+
+function runCodexBackgroundLaunch(request) {
+  const { cwd, workspaceRoot, prompt, model, resumeSessionId, ttlMinutes } = request;
+  ensureKimiAvailable(cwd, { codexOnce: true });
+
+  const taskMetadata = buildTaskRunMetadata({ prompt });
+  const jobId = generateJobId("task");
+  const claimToken = mintClaimToken();
+  const claimTokenHash = hashClaimToken(claimToken);
+  const ttlDeadline = computeTtlDeadline(ttlMinutes);
+  // Invariant A: this is the ONE place `write` is ever written.
+  const write = false;
+
+  const sealedGrant = {
+    id: jobId,
+    write,
+    ttlDeadline,
+    model: model ?? null,
+    resumeSessionId: resumeSessionId ?? null,
+    cwd,
+    claimTokenHash
+  };
+
+  const job = createJobRecord({
+    id: jobId,
+    kind: "task",
+    kindLabel: "task",
+    title: taskMetadata.title,
+    workspaceRoot,
+    jobClass: "task",
+    summary: taskMetadata.summary,
+    write
+  });
+  const { logFile } = createTrackedProgress(job);
+  appendLogLine(logFile, "Queued for Codex background execution.");
+
+  // The record must exist BEFORE the worker spawns: a fast worker that finds
+  // no stored job exits silently and the job stays queued forever.
+  const queuedRecord = {
+    ...job,
+    ...sealedGrant,
+    codexBackground: true,
+    status: "queued",
+    phase: "queued",
+    pid: null,
+    logFile,
+    ttlMinutes,
+    bootId: currentBootId(),
+    authoritySeal: computeAuthoritySeal(sealedGrant),
+    request: {
+      cwd,
+      prompt,
+      write,
+      model,
+      resumeLast: false,
+      resumeSessionId,
+      jobId,
+      preservePromptWhitespace: true,
+      codexBackground: true
+    }
+  };
+  // The single-active-job precondition is re-checked INSIDE the lock hold
+  // that inserts this record. Checking outside it (as the preflight does) is
+  // check-then-act: two concurrent launches both read "no active job", both
+  // spawn, and the loser dies at session/new with BROKER_BUSY — degrading
+  // back to the emergent broker behavior §4 says must be an explicit
+  // precondition.
+  const insert = insertJobUnderLock(workspaceRoot, queuedRecord, (jobs) => {
+    const active = findActiveJob(jobs);
+    return active ? buildSingleActiveJobRefusal(active) : null;
+  });
+  if (!insert.inserted) {
+    throw new Error(insert.refusal);
+  }
+
+  const child = spawnDetachedCodexWorker(cwd, jobId);
+  // Index-only pid patch: the worker rewrites its own job file at startup,
+  // and a full-record write here could clobber that.
+  upsertJob(workspaceRoot, { id: jobId, pid: child.pid ?? null });
+
+  outputResult(
+    {
+      launchStatus: "QUEUED",
+      jobId,
+      // The ONLY time the plaintext token exists outside this process. The
+      // record stores its SHA-256 and nothing else.
+      claimToken,
+      status: "queued",
+      write,
+      ttlMinutes,
+      ttlDeadline,
+      model: model ?? null,
+      workspaceRoot,
+      cwd,
+      createdAt: job.createdAt,
+      logFile
+    },
+    true
+  );
+}
+
+function authenticateCodexClaim(job, claim, { required, operation }) {
+  if (claim == null || claim === "") {
+    if (required) {
+      throw new Error(
+        `${operation} requires --claim <token>. The claim token was returned once, in the launch output; without it only coarse job metadata is available.`
+      );
+    }
+    return false;
+  }
+  if (!verifyClaimToken(claim, job.claimTokenHash)) {
+    throw new Error(
+      `The supplied claim token does not match job ${job.id}. Content, session ids, and results stay withheld.`
+    );
+  }
+  return true;
+}
+
+// Content, strictly separated from metadata. sessionId is content: leaking
+// it across conversations reconstructs resume-by-history through the back
+// door.
+function buildCodexStatusContent(job) {
+  return {
+    sessionId: job.threadId ?? null,
+    progressPreview: readJobProgressPreview(job.logFile),
+    touchedFiles: job.result?.touchedFiles ?? []
+  };
+}
+
+function runCodexJobStatus(options) {
+  const cwd = resolveCommandCwd(options);
+
+  // An EMPTY --codex-job is a malformed exact id, not a request to
+  // enumerate: falling back to the list would turn a typo into a broader
+  // disclosure than the caller asked for.
+  if (!Object.hasOwn(options, "codex-job")) {
+    const { workspaceRoot, jobs } = listCodexBackgroundJobs(cwd);
+    outputResult(
+      {
+        jobStatus: "OK",
+        workspaceRoot,
+        // Enumeration is coarse metadata only, for every job, always.
+        jobs: jobs.map((job) => buildCodexJobMetadata(job))
+      },
+      true
+    );
+    return;
+  }
+
+  const jobId = assertJobId(options["codex-job"]);
+  const { job } = resolveCodexBackgroundJob(cwd, jobId);
+  const authenticated = authenticateCodexClaim(job, options.claim, {
+    required: false,
+    operation: "status content"
+  });
+  outputResult(
+    {
+      jobStatus: "OK",
+      authenticated,
+      job: buildCodexJobMetadata(job),
+      content: authenticated ? buildCodexStatusContent(job) : null
+    },
+    true
+  );
+}
+
+function runCodexJobResult(options) {
+  const cwd = resolveCommandCwd(options);
+  const jobId = assertJobId(options["codex-job"]);
+  const { job } = resolveCodexBackgroundJob(cwd, jobId);
+  authenticateCodexClaim(job, options.claim, { required: true, operation: "result" });
+
+  if (isActiveCodexStatus(job.status)) {
+    throw new Error(`Job ${job.id} is still ${job.status}. Check its status and try again once it finishes.`);
+  }
+
+  outputResult(
+    {
+      jobStatus: "OK",
+      job: buildCodexJobMetadata(job),
+      result: job.result ?? null,
+      rendered: job.rendered ?? null
+    },
+    true
+  );
+}
+
+// Every cancel write is conditional on the job still being UNSETTLED, and the
+// condition is evaluated inside the same lock hold that commits the write.
+// An unconditional read-modify-write here is what let a cancel overwrite a
+// record that had already settled (F1): the check and the write were separate,
+// and the durable record — the guard's own evidence — was what got corrupted.
+function patchCodexJobIfUnsettled(workspaceRoot, jobId, patch) {
+  return patchJobUnderLock(workspaceRoot, jobId, ({ stored, indexed }) =>
+    settledCodexJobStatus(stored, indexed) ? null : patch
+  );
+}
+
+// The pre-write view patchJobUnderLock hands back, merged the same way
+// resolveCodexBackgroundJob merges: the index carries the freshest status, the
+// durable record carries everything else.
+function mergeJobViews({ stored, indexed }) {
+  return { ...(stored ?? {}), ...(indexed ?? {}) };
+}
+
+// A cancel that finds the job already settled reports that state as-is. It
+// never invents a verdict: "the session is gone" is evidence of COMPLETION
+// here, not of cancellation.
+//
+// `unknown` is the exception, and it is Invariant C again on the REPEAT
+// cancel. It is not a finished state — it is the runtime's word for "the turn
+// could not be shown stopped, and Kimi may still be running". Answering
+// NOT ACTIVE / residualRisk: null there would be an operation whose purpose is
+// to stop work reporting the work inactive on no evidence, contradicting the
+// record's own errorMessage. It keeps the residual risk and the nonzero exit
+// the first unconfirmed cancel used, and it is never PROMOTED: nothing here
+// observed the turn stop.
+function outputSettledCancel(jobId, status, { signalled, job = null }) {
+  const cancelled = status === "cancelled";
+  const unknown = status === "unknown";
+  const residualRisk = unknown
+    ? (job?.errorMessage ?? buildResidualRiskMessage(job?.write === true))
+    : null;
+  outputResult(
+    {
+      cancelStatus: cancelled ? "CANCELLED" : unknown ? "UNKNOWN" : "NOT ACTIVE",
+      jobId,
+      status,
+      confirmed: cancelled,
+      detail: cancelled
+        ? "Cancellation confirmed: the worker recorded a cancelled stop reason."
+        : unknown
+          ? `Job ${jobId} was already left \`unknown\`: an earlier cancellation could not be confirmed, and nothing here observed the turn stop.`
+          : signalled
+            ? `Job ${jobId} reached ${status} on its own before the cancellation took effect; its recorded result was left intact.`
+            : `Job ${jobId} is already ${status}; nothing was signalled.`,
+      residualRisk
+    },
+    true
+  );
+  if (unknown) {
+    process.exitCode = 1;
+  }
+}
+
+// Invariant C, the single most important rule in this phase: no invocation
+// whose purpose is to STOP work may declare it stopped. Killing is the
+// trigger; the broker is the confirmation.
+//
+// The legacy cancel path writes `cancelled` whenever any signal went out —
+// but `session/cancel` is an unacknowledged notification, and the broker
+// deliberately keeps a dead socket's turn alive. That path can therefore
+// report CANCELLED while Kimi is still mid-turn.
+async function runCodexJobCancel(options) {
+  const cwd = resolveCommandCwd(options);
+  const jobId = assertJobId(options["codex-job"]);
+  const { workspaceRoot, job, stored, indexed } = resolveCodexBackgroundJob(cwd, jobId);
+  // Cancel is deliberately token-free (owner decision Q3): termination
+  // de-escalates, and a job with no reachable off switch is the worse
+  // failure. A supplied --claim is IGNORED outright rather than validated:
+  // validating it would refuse the one operation with no off-switch on a
+  // typo, and would turn cancel into a claim-token oracle (right token
+  // proceeds, wrong token errors) for a caller who never reads content.
+
+  // Terminal in EITHER source is terminal. Trusting only the merged view —
+  // where the index wins — reads `running` from a stale index while the
+  // durable record already says `completed`.
+  const alreadySettled = settledCodexJobStatus(stored, indexed);
+  if (alreadySettled) {
+    outputSettledCancel(jobId, alreadySettled, { signalled: false, job });
+    return;
+  }
+
+  const sessionId = job.threadId ?? null;
+  // Step 1: record the INTENT. Never a terminal state — and never over a job
+  // that settled between the check above and this write.
+  const cancelRequestedAt = nowIso();
+  const requested = patchCodexJobIfUnsettled(workspaceRoot, jobId, {
+    status: "cancel-requested",
+    phase: "cancel-requested",
+    cancelRequestedAt
+  });
+  if (!requested.applied) {
+    outputSettledCancel(jobId, settledCodexJobStatus(requested.stored, requested.indexed), {
+      signalled: false,
+      job: mergeJobViews(requested)
+    });
+    return;
+  }
+  appendLogLine(job.logFile, `Cancellation requested for session ${sessionId ?? "(none recorded)"}.`);
+
+  const cancel = await cancelKimiSession(cwd, { sessionId });
+  const kill = terminateProcessTree(job.pid ?? Number.NaN);
+  // Second attempt AFTER the worker kill: the first can be a no-op when the
+  // broker state was not saved yet, and the worker's socket death also arms
+  // the broker's own cancelOnDisconnect.
+  const postKillCancel = await cancelKimiSession(cwd, { sessionId });
+
+  // Port verbatim: never report a cancel that provably did nothing.
+  if (!cancel.attempted && !postKillCancel.attempted && !kill.delivered) {
+    throw new Error(
+      `Could not cancel ${jobId}: no reachable worker process or shared runtime (${cancel.detail}). The job is left as cancel-requested; check its status and retry.`
+    );
+  }
+
+  // Step 4: bounded confirmation. Evidence is the worker recording a
+  // cancelled stop reason, or the broker showing the session gone.
+  const deadline = Date.now() + CANCEL_CONFIRM_WINDOW_MS;
+  let confirmedBy = null;
+  let probeDetail = "no broker probe was answered";
+  for (;;) {
+    const current = readStoredJob(workspaceRoot, jobId) ?? {};
+    if (current.result?.stopReason === "cancelled" || current.status === "cancelled") {
+      confirmedBy = "the worker recorded a cancelled stop reason";
+      break;
+    }
+    // The probe gets only the window that is actually left, so a stalled
+    // broker cannot outlast the confirmation deadline it is evidence for.
+    const probe = await probeBrokerStatus(cwd, {
+      timeoutMs: Math.max(CANCEL_CONFIRM_POLL_MS, deadline - Date.now())
+    });
+    probeDetail = probe.detail;
+    if (!probe.running) {
+      confirmedBy = "no shared Kimi runtime is active, so no turn can be in flight";
+      break;
+    }
+    if (probe.reachable && sessionId && !probe.activeSessions.includes(sessionId)) {
+      confirmedBy = `broker/status no longer lists session ${sessionId}`;
+      break;
+    }
+    if (Date.now() >= deadline) {
+      break;
+    }
+    await sleep(Math.min(CANCEL_CONFIRM_POLL_MS, Math.max(0, deadline - Date.now())));
+  }
+
+  const completedAt = nowIso();
+
+  // Invariant C cuts both ways. The job may have SETTLED ON ITS OWN inside
+  // the confirmation window — in which case "the session is gone" is
+  // evidence of completion, not of cancellation. Writing `cancelled` here
+  // would destroy the user's recorded result and mislabel the turn, the
+  // same mislabeling class runTrackedJob guards in the other direction.
+  // The settled-check is re-evaluated INSIDE the write's lock hold, so a
+  // completion landing after this point still wins.
+  if (confirmedBy) {
+    const confirmedWrite = patchCodexJobIfUnsettled(workspaceRoot, jobId, {
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt,
+      errorMessage: `Cancelled by user; confirmed because ${confirmedBy}.`
+    });
+    if (!confirmedWrite.applied) {
+      outputSettledCancel(
+        jobId,
+        settledCodexJobStatus(confirmedWrite.stored, confirmedWrite.indexed),
+        { signalled: true, job: mergeJobViews(confirmedWrite) }
+      );
+      return;
+    }
+    appendLogLine(job.logFile, `Cancellation confirmed: ${confirmedBy}.`);
+    outputResult(
+      {
+        cancelStatus: "CANCELLED",
+        jobId,
+        status: "cancelled",
+        confirmed: true,
+        detail: `Cancellation confirmed: ${confirmedBy}.`,
+        residualRisk: null
+      },
+      true
+    );
+    return;
+  }
+
+  const residualRisk = buildResidualRiskMessage(job.write === true);
+  const unknownWrite = patchCodexJobIfUnsettled(workspaceRoot, jobId, {
+    status: "unknown",
+    phase: "unknown",
+    pid: null,
+    completedAt,
+    errorMessage: residualRisk
+  });
+  if (!unknownWrite.applied) {
+    // Nothing is unconfirmed: the job settled on its own. Exit 0 — the
+    // nonzero exit below means "this cancel could not be shown to work".
+    outputSettledCancel(jobId, settledCodexJobStatus(unknownWrite.stored, unknownWrite.indexed), {
+      signalled: true,
+      job: mergeJobViews(unknownWrite)
+    });
+    return;
+  }
+  appendLogLine(job.logFile, `Cancellation unconfirmed: ${probeDetail}.`);
+  outputResult(
+    {
+      cancelStatus: "UNKNOWN",
+      jobId,
+      status: "unknown",
+      confirmed: false,
+      detail: `The turn could not be shown stopped inside the confirmation window (${probeDetail}).`,
+      residualRisk
+    },
+    true
+  );
+  process.exitCode = 1;
+}
+
 function readTaskPrompt(cwd, options, positionals) {
   if (options["prompt-file"]) {
     return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
@@ -768,8 +1306,18 @@ function readTaskPrompt(cwd, options, positionals) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "prompt-file", "model", "effort", "resume-session"],
-    booleanOptions: ["json", "write", "read-only", "resume-last", "resume", "fresh", "background", "codex-once"],
+    valueOptions: ["cwd", "prompt-file", "model", "effort", "resume-session", "ttl-minutes"],
+    booleanOptions: [
+      "json",
+      "write",
+      "read-only",
+      "resume-last",
+      "resume",
+      "fresh",
+      "background",
+      "codex-once",
+      "codex-background"
+    ],
     aliasMap: {
       m: "model"
     }
@@ -784,11 +1332,51 @@ async function handleTask(argv) {
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const codexOnce = Boolean(options["codex-once"]);
+  const codexBackground = Boolean(options["codex-background"]);
   const resumeLast = Boolean(options["resume-last"] || options.resume);
   const fresh = Boolean(options.fresh);
   const resumeSessionId = options["resume-session"] == null
     ? null
     : String(options["resume-session"]).trim();
+
+  if (codexBackground) {
+    if (codexOnce) {
+      throw new Error("Choose either --codex-once (foreground) or --codex-background.");
+    }
+    if (options.background) {
+      throw new Error("--codex-background replaces the legacy --background flag; pass only --codex-background.");
+    }
+    // Machine-readable on success AND refusal, like the one-shot envelope.
+    if (!options.json) {
+      throw new Error("Codex background launches require --json.");
+    }
+    // The RAW flag, deliberately not reconciled with --read-only. Background
+    // is sealed read-only either way, so reconciling first would let
+    // `--write --read-only` slip past as a silent read-only launch instead of
+    // the documented refusal naming `task --codex-once --write`.
+    const workspaceRoot = resolveCommandWorkspace(options);
+    assertCodexBackgroundLaunchAllowed({ write: Boolean(options.write), resumeLast, workspaceRoot });
+    if (resumeSessionId && fresh) {
+      throw new Error("Choose either --fresh or --resume-session.");
+    }
+    if (Object.hasOwn(options, "resume-session") && !resumeSessionId) {
+      throw new Error("--resume-session requires a non-empty ACP session id.");
+    }
+    const ttlMinutes = resolveTtlMinutes(options["ttl-minutes"]);
+    if (!prompt && !resumeSessionId) {
+      throw new Error("Provide a prompt, a prompt file, piped stdin, or --resume-session <exact-session-id>.");
+    }
+    runCodexBackgroundLaunch({
+      cwd,
+      workspaceRoot,
+      prompt,
+      model,
+      resumeSessionId,
+      ttlMinutes
+    });
+    return;
+  }
+
   if (codexOnce && options.background) {
     throw new Error("Codex one-shot tasks do not support --background; durable jobs remain deferred.");
   }
@@ -889,11 +1477,45 @@ async function handleTaskWorker(argv) {
     { ...storedJob, workspaceRoot },
     { logFile: storedJob.logFile ?? null }
   );
-  await runTrackedJob(
-    { ...storedJob, workspaceRoot, logFile },
-    () => executeTaskRun({ ...request, onProgress: progress }),
-    { logFile }
-  );
+
+  // KMP-32: a Codex background worker re-validates the grant it is about to
+  // act on and fails LOUDLY on any mismatch. The sealed record — never the
+  // request payload — is the authority for `write`.
+  const overrides = {};
+  const abortController = new AbortController();
+  let ttlTimer = null;
+  let ttlExpired = false;
+  if (storedJob.codexBackground) {
+    assertSealedLaunchAuthority(storedJob);
+    overrides.write = storedJob.write;
+    overrides.model = storedJob.model ?? null;
+    overrides.resumeSessionId = storedJob.resumeSessionId ?? null;
+    overrides.signal = abortController.signal;
+    // Self-abort at the sealed deadline. The reconciler enforces the same
+    // deadline externally, because a wedged worker will not honor its timer.
+    overrides.cancelOnDisconnect = true;
+    const remainingMs = Date.parse(storedJob.ttlDeadline ?? "") - Date.now();
+    ttlTimer = setTimeout(() => {
+      ttlExpired = true;
+      abortController.abort();
+    }, Math.max(0, Number.isFinite(remainingMs) ? remainingMs : 0));
+    ttlTimer.unref?.();
+  }
+
+  try {
+    await runTrackedJob(
+      { ...storedJob, workspaceRoot, logFile },
+      () => executeTaskRun({ ...request, ...overrides, onProgress: progress }),
+      { logFile }
+    );
+  } finally {
+    if (ttlTimer) {
+      clearTimeout(ttlTimer);
+    }
+    if (ttlExpired) {
+      attributeTtlExpiry(workspaceRoot, storedJob.id);
+    }
+  }
 }
 
 async function handleSetup(argv) {
@@ -956,9 +1578,14 @@ async function handleSetup(argv) {
 
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
-    booleanOptions: ["json", "all", "wait"]
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms", "codex-job", "claim"],
+    booleanOptions: ["json", "all", "wait", "codex-jobs"]
   });
+
+  if (options["codex-job"] != null || options["codex-jobs"]) {
+    runCodexJobStatus(options);
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -983,9 +1610,14 @@ async function handleStatus(argv) {
 
 function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "codex-job", "claim"],
     booleanOptions: ["json"]
   });
+
+  if (options["codex-job"] != null) {
+    runCodexJobResult(options);
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -1032,9 +1664,14 @@ function handleTaskResumeCandidate(argv) {
 
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "codex-job", "claim"],
     booleanOptions: ["json"]
   });
+
+  if (options["codex-job"] != null) {
+    await runCodexJobCancel(options);
+    return;
+  }
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
@@ -1152,6 +1789,25 @@ function hasFrozenReviewIntent(argv) {
   );
 }
 
+function hasCodexBackgroundIntent(argv) {
+  return (
+    argv[0] === "task" &&
+    argv.some(
+      (arg) => arg === "--codex-background" || (arg.startsWith("--codex-background=") && arg !== "--codex-background=false")
+    )
+  );
+}
+
+// The $kimi-job observation surface. Its skill tells the model to parse JSON,
+// so a refusal (malformed id, `result` on a running job) must not exit with
+// empty stdout — the same defect class already hardened for --codex-once.
+function hasCodexJobIntent(argv) {
+  if (!["status", "result", "cancel"].includes(argv[0])) {
+    return false;
+  }
+  return argv.some((arg) => arg === "--codex-job" || arg.startsWith("--codex-job="));
+}
+
 function hasCodexOneShotIntent(argv) {
   // Mirror parseArgs boolean semantics: --codex-once=false is NOT one-shot
   // intent, so failures on the legacy path never emit the one-shot envelope.
@@ -1180,6 +1836,18 @@ main().catch((error) => {
       console.log(JSON.stringify({ reviewStatus: "NOT REVIEWED", error: message, ...details }, null, 2));
     }
     process.stderr.write(`NOT REVIEWED: ${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (hasCodexBackgroundIntent(normalizedArgv) && jsonOutput) {
+    console.log(JSON.stringify({ launchStatus: "REFUSED", error: message }, null, 2));
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (hasCodexJobIntent(normalizedArgv) && jsonOutput) {
+    console.log(JSON.stringify({ jobStatus: "REFUSED", error: message }, null, 2));
+    process.stderr.write(`${message}\n`);
     process.exitCode = 1;
     return;
   }

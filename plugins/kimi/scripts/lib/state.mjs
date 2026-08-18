@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { assertJobId, isActiveCodexStatus } from "./codex-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -163,10 +164,25 @@ export function loadState(cwd) {
   }
 }
 
+// KMP-32: an ACTIVE CODEX job is never pruned, however old its index entry
+// looks. `updatedAt` is not a liveness proxy — createJobProgressUpdater
+// upserts only when the phase/threadId/turnId CHANGES, so a long quiet turn
+// goes stale in the index while its worker is still running. Pruning it would
+// delete the record and log of a live detached process.
+//
+// The exemption is gated on codexBackground because legacy records have no
+// bootId check and no deadline: a legacy `queued` entry with a null or
+// recycled-alive pid can never go terminal, and exempting it too would keep
+// it forever — where findActiveWorkspaceJob, which scans ALL jobs, would then
+// refuse every background launch in the workspace with no way to clear it.
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort((left, right) =>
+    String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
+  );
+  const active = sorted.filter((job) => job.codexBackground && isActiveCodexStatus(job.status));
+  const activeIds = new Set(active.map((job) => job.id));
+  const retained = sorted.filter((job) => !activeIds.has(job.id)).slice(0, Math.max(0, MAX_JOBS - active.length));
+  return sorted.filter((job) => activeIds.has(job.id) || retained.includes(job));
 }
 
 function removeFileIfExists(filePath) {
@@ -263,8 +279,11 @@ export function updateState(cwd, mutate) {
   }
 }
 
+// The suffix is padded to a FIXED six characters: the strict job-id pattern
+// that guards every filesystem path is exact, so a generator that can emit
+// a short suffix would occasionally mint an id its own validator rejects.
 export function generateJobId(prefix = "job") {
-  const random = Math.random().toString(36).slice(2, 8);
+  const random = Math.random().toString(36).slice(2, 8).padEnd(6, "0");
   return `${prefix}-${Date.now().toString(36)}-${random}`;
 }
 
@@ -290,6 +309,110 @@ export function upsertJob(cwd, jobPatch) {
 
 export function listJobs(cwd) {
   return loadState(cwd).jobs;
+}
+
+// KMP-32 F1/F7: a job's truth lives in TWO places — the durable record and
+// the index — written by launcher, worker, and cancel processes at once.
+// Deciding from a read and then writing is how a cancel overwrites a job
+// that settled a millisecond earlier, and how two launches both see "no
+// active job". These two helpers run the DECISION inside the same lock hold
+// that commits it, so no writer can land in between.
+//
+// They deliberately do not call upsertJob/saveState: those take the lock
+// themselves, and re-entering it would stall for the full 2s lock timeout.
+
+// These two helpers exist BECAUSE the decision and the write must share one
+// lock hold, so they may not fall back to the legacy proceed-unlocked
+// behaviour: acquireStateLock returns null only after ~2s of contention —
+// exactly the moment another writer is proven to be there — and carrying on
+// then would run the read-decide-write sequence with no synchronization at
+// all. Failing closed costs a retryable error; failing open costs a
+// clobbered record or a second concurrent launch.
+//
+// Deliberately NOT applied to saveState/updateState: the legacy Claude
+// surface runs through those, and its behaviour stays byte-identical.
+// Typed so an OPPORTUNISTIC caller can tell "another command holds the lock"
+// (leave it for the next reader) apart from a real failure it must not
+// swallow. Callers that are committing a decision — a launch, a cancel — let
+// it propagate.
+export class StateLockUnavailableError extends Error {
+  constructor() {
+    super(
+      "Could not acquire the Kimi job-state lock; another command is holding it. Nothing was changed — retry the operation."
+    );
+    this.name = "StateLockUnavailableError";
+  }
+}
+
+function requireStateLock(cwd) {
+  const lock = acquireStateLock(cwd);
+  if (!lock) {
+    throw new StateLockUnavailableError();
+  }
+  return lock;
+}
+
+function applyJobPatchUnlocked(state, jobId, patch) {
+  const timestamp = nowIso();
+  const existingIndex = state.jobs.findIndex((job) => job.id === jobId);
+  if (existingIndex === -1) {
+    state.jobs.unshift({ createdAt: timestamp, updatedAt: timestamp, ...patch, id: jobId });
+    return;
+  }
+  state.jobs[existingIndex] = {
+    ...state.jobs[existingIndex],
+    ...patch,
+    id: jobId,
+    updatedAt: timestamp
+  };
+}
+
+// `decide` receives the freshest {stored, indexed} view and returns a patch
+// to apply to BOTH, or null to abort the write. The pre-write view is
+// returned either way, so a caller that aborted can report what it saw.
+export function patchJobUnderLock(cwd, jobId, decide) {
+  const lock = requireStateLock(cwd);
+  try {
+    const jobFile = resolveJobFile(cwd, jobId);
+    const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+    const state = loadState(cwd);
+    const indexed = state.jobs.find((job) => job.id === jobId) ?? null;
+
+    const patch = decide({ stored, indexed });
+    if (!patch) {
+      return { applied: false, stored, indexed };
+    }
+
+    if (stored) {
+      writeJobFile(cwd, jobId, { ...stored, ...patch, id: jobId });
+    }
+    applyJobPatchUnlocked(state, jobId, patch);
+    saveStateUnlocked(cwd, state);
+    return { applied: true, stored, indexed };
+  } finally {
+    releaseStateLock(lock);
+  }
+}
+
+// `decide` receives the freshest job list and returns a refusal message, or
+// null to commit `record`. The check and the insert share one lock hold, so
+// a second launch cannot pass the same precondition concurrently.
+export function insertJobUnderLock(cwd, record, decide) {
+  const lock = requireStateLock(cwd);
+  try {
+    const state = loadState(cwd);
+    const refusal = decide(state.jobs);
+    if (refusal) {
+      return { inserted: false, refusal };
+    }
+
+    writeJobFile(cwd, record.id, record);
+    applyJobPatchUnlocked(state, record.id, record);
+    saveStateUnlocked(cwd, state);
+    return { inserted: true, refusal: null };
+  } finally {
+    releaseStateLock(lock);
+  }
 }
 
 export function setConfig(cwd, key, value) {
@@ -322,12 +445,17 @@ function removeJobFile(jobFile) {
   }
 }
 
+// Both path builders validate the id FIRST. This is the single chokepoint
+// every caller-supplied job reference reaches, so `../state` can never be
+// joined into a real, parseable file inside the state dir.
 export function resolveJobLogFile(cwd, jobId) {
+  assertJobId(jobId);
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
 }
 
 export function resolveJobFile(cwd, jobId) {
+  assertJobId(jobId);
   ensureStateDir(cwd);
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }

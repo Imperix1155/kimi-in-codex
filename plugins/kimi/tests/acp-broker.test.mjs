@@ -222,9 +222,22 @@ await withBroker("slow-prompt", async (session, cwd) => {
   assert.ok(busy, "expected busy while the dead client's turn still runs");
   assert.equal(busy.code, BROKER_BUSY_RPC_CODE);
 
-  // After the abandoned turn completes, ownership released cleanly.
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  const after = await clientB.request("session/new", { cwd, mcpServers: [] });
+  // After the abandoned turn completes, ownership released cleanly. Waited
+  // for, not slept through: a fixed settle assumed the abandoned turn had
+  // finished, and a loaded runner reports the still-busy broker as a failure
+  // to release ownership.
+  let after = null;
+  const releaseDeadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      after = await clientB.request("session/new", { cwd, mcpServers: [] });
+      break;
+    } catch (error) {
+      assert.equal(error.code, BROKER_BUSY_RPC_CODE, `unexpected error while waiting for release: ${error.message}`);
+      assert.ok(Date.now() < releaseDeadline, "ownership was never released after the abandoned turn completed");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
   assert.ok(after.sessionId);
   await clientB.close();
 });
@@ -253,7 +266,7 @@ await withBroker("slow-prompt", async (session, cwd) => {
 
       const clientB = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
       let nextSession = null;
-      const deadline = Date.now() + 2000;
+      const deadline = Date.now() + 15_000;
       while (!nextSession && Date.now() < deadline) {
         try {
           nextSession = await clientB.request("session/new", { cwd, mcpServers: [] });
@@ -273,6 +286,127 @@ await withBroker("slow-prompt", async (session, cwd) => {
       delete process.env.KIMI_FAKE_CANCEL_MARKER;
     } else {
       process.env.KIMI_FAKE_CANCEL_MARKER = previousMarker;
+    }
+  }
+}
+
+// 8c. KMP-32 (§12 #12). broker/status is answered LOCALLY and BEFORE the
+// busy gate: a probe arriving while another socket owns an in-flight turn
+// must get the real answer, naming the exact session in flight. Placed
+// after the gate it would return BROKER_BUSY and the caller would learn
+// nothing — which is the entire point of the method.
+await withBroker("slow-prompt-3s", async (session, cwd) => {
+  const clientA = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+  await clientA.request("session/new", { cwd, mcpServers: [] });
+  const turn = clientA.request("session/prompt", { sessionId: "sess-1", prompt: [{ type: "text", text: "x" }] });
+
+  const clientB = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+  // PRECONDITION, established from an INDEPENDENT oracle. A fixed sleep here
+  // assumed the prompt had reached the agent; on a loaded runner it has not,
+  // and the block then fails as though broker/status had misreported.
+  //
+  // The oracle is deliberately NOT broker/status: this block exists to prove
+  // broker/status sits BEFORE the busy gate, so establishing busy-ness with
+  // broker/status would let a regression that moves it behind the gate fail
+  // the precondition instead of the assertion. An ordinary method going
+  // BROKER_BUSY is independent evidence of the same fact.
+  let busy = null;
+  const busyDeadline = Date.now() + 15_000;
+  while (!busy && Date.now() < busyDeadline) {
+    try {
+      await clientB.request("session/new", { cwd, mcpServers: [] });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } catch (error) {
+      busy = error;
+    }
+  }
+  assert.ok(busy, "PRECONDITION — no turn ever went in flight, so the busy gate was never exercised");
+  assert.equal(busy.code, BROKER_BUSY_RPC_CODE);
+
+  const status = await clientB.request("broker/status", {});
+  assert.equal(status.agentAlive, true);
+  assert.equal(status.busy, true, "broker/status must report the busy state, not be blocked by it");
+  assert.deepEqual(status.activeSessions, ["sess-1"], "broker/status must name the exact in-flight session");
+
+  await turn;
+  const idle = await clientB.request("broker/status", {});
+  assert.equal(idle.busy, false);
+  assert.deepEqual(idle.activeSessions, [], "a settled turn must leave no active session behind");
+  await clientA.close();
+  await clientB.close();
+});
+
+// 8d. KMP-32 (§12 #13). Background-worker shape of disconnect cancellation:
+// the owning socket dies, the broker fires session/cancel for that exact
+// session — and when the agent IGNORES it the turn stays in flight, which
+// broker/status reports truthfully. This is the evidence a cancel caller
+// needs to refuse a false terminal CANCELLED.
+{
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-survive-marker-"));
+  const cancelMarker = path.join(markerDir, "cancelled.txt");
+  const previousCancelMarker = process.env.KIMI_FAKE_CANCEL_MARKER;
+  const previousSurviveDelay = process.env.KIMI_FAKE_SURVIVE_DELAY_MS;
+  process.env.KIMI_FAKE_CANCEL_MARKER = cancelMarker;
+  process.env.KIMI_FAKE_SURVIVE_DELAY_MS = "4000";
+  try {
+    await withBroker("turn-survives-socket-death", async (session, cwd) => {
+      const worker = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      const workerSession = await newSession(worker, cwd);
+      await worker.setSessionPermissionDecision(workerSession.sessionId, "reject", {
+        cancelOnDisconnect: true
+      });
+      worker.request("session/prompt", {
+        sessionId: workerSession.sessionId,
+        prompt: [{ type: "text", text: "detached background turn" }]
+      }).catch(() => {});
+
+      // PRECONDITION: killing the socket only tests disconnect-cancellation if
+      // a turn is actually in flight when it dies. A fixed sleep assumed that;
+      // a loaded runner does not honour the assumption.
+      const inFlight = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      let flightSeen = false;
+      const flightDeadline = Date.now() + 15_000;
+      while (!flightSeen && Date.now() < flightDeadline) {
+        const probe = await inFlight.request("broker/status", {});
+        flightSeen = probe.activeSessions.includes(workerSession.sessionId);
+        if (!flightSeen) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      await inFlight.close();
+      assert.ok(flightSeen, "PRECONDITION — the worker's turn never went in flight before its socket was killed");
+      worker.socket.destroy();
+
+      const observer = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      let cancelSeen = false;
+      const deadline = Date.now() + 2000;
+      while (!cancelSeen && Date.now() < deadline) {
+        cancelSeen = fs.existsSync(cancelMarker);
+        if (!cancelSeen) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      assert.ok(cancelSeen, "socket death must fire session/cancel for the worker's session");
+
+      const status = await observer.request("broker/status", {});
+      assert.equal(status.busy, true, "an ignored cancel must leave the turn in flight");
+      assert.deepEqual(
+        status.activeSessions,
+        [workerSession.sessionId],
+        "broker/status must still name the session an ignored cancel left running"
+      );
+      await observer.close();
+    });
+  } finally {
+    if (previousCancelMarker === undefined) {
+      delete process.env.KIMI_FAKE_CANCEL_MARKER;
+    } else {
+      process.env.KIMI_FAKE_CANCEL_MARKER = previousCancelMarker;
+    }
+    if (previousSurviveDelay === undefined) {
+      delete process.env.KIMI_FAKE_SURVIVE_DELAY_MS;
+    } else {
+      process.env.KIMI_FAKE_SURVIVE_DELAY_MS = previousSurviveDelay;
     }
   }
 }
@@ -768,6 +902,48 @@ for (const spawnCase of [
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   }
+}
+
+// 16. A broker.lock orphaned by a killed holder must not become a wall.
+//
+// The lock is stolen once it goes BROKER_LOCK_STALE_MS untouched, but
+// ensureBrokerSession used to give up after ~5s — ten seconds before its own
+// recovery could fire. So any client arriving while an orphaned lock was
+// fresh was GUARANTEED to fail, and to fail as "Failed to start the shared
+// agent broker": a start it never attempted, with none of the startup
+// diagnostics KMP-32 added, because the lock was never acquired.
+//
+// Observed on PR #4 CI: the deadline-path test SIGKILLs a worker as soon as
+// its record says `running`, and runTrackedJob writes `running` BEFORE the
+// runner opens a client — so the kill can land while the worker holds this
+// lock, and the next worker inherits the wall.
+{
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-lockwall-"));
+  const { BROKER_LOCK_STALE_MS } = await import("../scripts/lib/broker-lifecycle.mjs");
+  const { resolveStateDir } = await import("../scripts/lib/state.mjs");
+
+  // A lock left behind by a holder that was killed mid-spawn: it exists, its
+  // mtime is fresh, and nobody will ever release it.
+  const lockDir = path.join(resolveStateDir(cwd), "broker.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+
+  const startedAt = Date.now();
+  const session = await ensureBrokerSession(cwd, { extraBrokerArgs: agentSpawnArgs("basic") });
+  const waited = Date.now() - startedAt;
+
+  assert.ok(session?.endpoint, "an orphaned lock must be stolen, not treated as a permanent wall");
+  assert.ok(
+    waited >= BROKER_LOCK_STALE_MS,
+    `the steal cannot fire before the lock is stale (waited ${waited}ms)`
+  );
+  // The load-bearing assertion: the caller must outlast its own recovery
+  // window. Giving up first is what made the failure guaranteed.
+  assert.ok(
+    waited < BROKER_LOCK_STALE_MS + 10_000,
+    `the wait must end shortly after the steal, not drag on (waited ${waited}ms)`
+  );
+  await sendBrokerShutdown(session.endpoint).catch(() => {});
+  await waitForEndpointDeath(session.endpoint);
 }
 
 console.log("ACP-BROKER-TESTS-GREEN");

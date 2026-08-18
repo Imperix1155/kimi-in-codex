@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kimi Job"
+  short_description: "Check, read, or stop one Kimi background job"
+  default_prompt: "Use $kimi-job to check on the Kimi background job with this exact job ID."

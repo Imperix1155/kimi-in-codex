@@ -9,7 +9,7 @@
 import process from "node:process";
 import { AcpClient, BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV } from "./acp-client.mjs";
 import { AGENT_SPAWN_ENV, getAgentProfile, isAuthRequiredError } from "./agent-profile.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { loadBrokerSession, readBrokerSessionState } from "./broker-lifecycle.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 export const DEFAULT_CONTINUE_PROMPT =
@@ -796,6 +796,85 @@ export async function cancelKimiSession(cwd, { sessionId }) {
     return { attempted: true, detail: `Sent session/cancel for ${sessionId}.` };
   } catch (error) {
     return { attempted: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// Default probe budget. Comfortably under CANCEL_CONFIRM_WINDOW_MS so a
+// single stalled probe cannot consume the caller's whole window; the cancel
+// loop passes its own remaining budget explicitly.
+export const BROKER_STATUS_PROBE_TIMEOUT_MS = 2000;
+const BROKER_STATUS_PROBE_FLOOR_MS = 100;
+
+function withProbeTimeout(pending, timeoutMs, budgetMs) {
+  let timer = null;
+  return Promise.race([
+    pending,
+    new Promise((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`broker/status did not answer within the ${budgetMs}ms probe budget`)),
+        timeoutMs
+      );
+      timer.unref?.();
+    })
+  ]).finally(() => clearTimeout(timer));
+}
+
+// KMP-32: ask the live broker what is actually in flight. This is the
+// CONFIRMATION half of cancellation: killing a worker only proves a signal
+// was delivered, while the broker deliberately keeps a dead socket's turn
+// alive. Never spawns a broker — a runtime that is not up cannot be running
+// a turn, and that fact is itself reported (`running: false`).
+export async function probeBrokerStatus(cwd, options = {}) {
+  // The probe is EVIDENCE for a cancellation verdict, and the caller polls it
+  // inside a bounded window. Neither the connect nor the request was bounded,
+  // so a broker that accepts the socket and then stops answering hung the
+  // whole loop past its own deadline — the loop cannot inspect the deadline
+  // until the pending probe returns. One budget covers both legs.
+  const budgetMs = options.timeoutMs ?? BROKER_STATUS_PROBE_TIMEOUT_MS;
+  const probeDeadline = Date.now() + budgetMs;
+  const remainingMs = () => Math.max(BROKER_STATUS_PROBE_FLOOR_MS, probeDeadline - Date.now());
+
+  const { present, session } = readBrokerSessionState(cwd);
+  const endpoint = session?.endpoint ?? null;
+  if (!endpoint) {
+    if (!present) {
+      return { reachable: false, running: false, detail: "no shared Kimi runtime is active", activeSessions: [] };
+    }
+    // A pointer that exists but cannot be read is not evidence of ANYTHING.
+    // loadBrokerSession returns null for missing and malformed alike, and
+    // treating the malformed case as `running: false` would let a cancel
+    // report a confirmed stop on a broker that may still be mid-turn.
+    return {
+      reachable: false,
+      running: true,
+      activeSessions: [],
+      detail: "the shared Kimi runtime's state record is present but unreadable, so nothing about a turn in flight can be established"
+    };
+  }
+  let client = null;
+  try {
+    client = await AcpClient.connect(cwd, { brokerEndpoint: endpoint, connectTimeoutMs: remainingMs() });
+    const result = await withProbeTimeout(client.request("broker/status", {}), remainingMs(), budgetMs);
+    const activeSessions = Array.isArray(result?.activeSessions) ? result.activeSessions : [];
+    return {
+      reachable: true,
+      running: true,
+      agentAlive: result?.agentAlive !== false,
+      busy: Boolean(result?.busy),
+      activeSessions,
+      detail: `broker/status reported ${activeSessions.length} session(s) in flight`
+    };
+  } catch (error) {
+    return {
+      reachable: false,
+      // The endpoint was recorded but did not answer: we do NOT know whether
+      // a turn is in flight, so this can never count as confirmation.
+      running: true,
+      activeSessions: [],
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  } finally {
+    await client?.close().catch(() => {});
   }
 }
 

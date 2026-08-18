@@ -68,11 +68,24 @@ rl.on("line", (line) => {
   // cancel arriving BEFORE the prompt is remembered and applied to the next
   // prompt immediately (mirrors real agents: no interleaving hangs forever).
   if (message.id === undefined && message.method === "session/cancel") {
-    if (scenario === "cancellable" || scenario === "cancel-write-delay" || scenario === "cancel-unconfirmed") {
+    if (
+      scenario === "cancellable" ||
+      scenario === "cancel-write-delay" ||
+      scenario === "cancel-unconfirmed" ||
+      scenario === "cancel-ignored" ||
+      scenario === "turn-survives-socket-death"
+    ) {
       if (process.env.KIMI_FAKE_CANCEL_MARKER) {
         fs.writeFileSync(process.env.KIMI_FAKE_CANCEL_MARKER, "cancelled\n", "utf8");
       }
-      if (scenario === "cancel-unconfirmed") {
+      // KMP-32: these three deliberately IGNORE the cancel. They are the
+      // fixtures that exercise the false-CANCELLED path — the runtime must
+      // land on `unknown`, never on a terminal `cancelled`.
+      if (
+        scenario === "cancel-unconfirmed" ||
+        scenario === "cancel-ignored" ||
+        scenario === "turn-survives-socket-death"
+      ) {
         return;
       }
       if (heldPromptTimer) {
@@ -428,11 +441,45 @@ rl.on("line", (line) => {
       return;
     }
 
-    if (scenario === "cancel-unconfirmed") {
+    if (scenario === "cancel-unconfirmed" || scenario === "cancel-ignored") {
       if (process.env.KIMI_FAKE_PROMPT_MARKER) {
         fs.writeFileSync(process.env.KIMI_FAKE_PROMPT_MARKER, "prompt-active\n", "utf8");
       }
       heldPromptId = message.id;
+      return;
+    }
+
+    // KMP-32: the turn OUTLIVES the socket that owns it. The broker's
+    // cancelOnDisconnect fires session/cancel when the worker dies, this
+    // agent ignores it, and the turn completes anyway — the exact shape a
+    // "killed the worker, therefore CANCELLED" claim would get wrong.
+    if (scenario === "turn-survives-socket-death") {
+      if (process.env.KIMI_FAKE_PROMPT_MARKER) {
+        fs.writeFileSync(process.env.KIMI_FAKE_PROMPT_MARKER, "prompt-active\n", "utf8");
+      }
+      const sid = message.params.sessionId ?? "sess-1";
+      heldPromptId = message.id;
+      heldPromptTimer = setTimeout(() => {
+        const promptId = heldPromptId;
+        heldPromptId = null;
+        heldPromptTimer = null;
+        if (process.env.KIMI_FAKE_POST_CANCEL_MARKER) {
+          fs.writeFileSync(process.env.KIMI_FAKE_POST_CANCEL_MARKER, "survived\n", "utf8");
+        }
+        send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "turn survived its socket" } } } });
+        send({ id: promptId, result: { stopReason: "end_turn" } });
+      }, Number(process.env.KIMI_FAKE_SURVIVE_DELAY_MS) || 750);
+      return;
+    }
+
+    // KMP-32: the agent dies mid-turn, which takes the broker down with it
+    // (broker exits on appClient.exitPromise). Verifies — rather than
+    // assumes — that the worker's pending session/prompt rejects.
+    if (scenario === "broker-dies-mid-turn") {
+      if (process.env.KIMI_FAKE_PROMPT_MARKER) {
+        fs.writeFileSync(process.env.KIMI_FAKE_PROMPT_MARKER, "prompt-active\n", "utf8");
+      }
+      setTimeout(() => process.exit(4), Number(process.env.KIMI_FAKE_AGENT_DEATH_DELAY_MS) || 300);
       return;
     }
 

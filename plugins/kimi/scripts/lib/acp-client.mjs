@@ -364,6 +364,11 @@ class SpawnedAcpClient extends AcpClientBase {
   }
 }
 
+// How long a graceful socket close may take before we stop waiting on the
+// peer and destroy our end. Socket teardown against a live peer is
+// sub-millisecond; this only bounds a wedged one.
+const BROKER_CLOSE_GRACE_MS = 250;
+
 class BrokerAcpClient extends AcpClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
@@ -431,6 +436,31 @@ class BrokerAcpClient extends AcpClientBase {
     this.closed = true;
     if (this.socket) {
       this.socket.end();
+      // `end()` only sends OUR half. A wedged peer never closes its own, and
+      // exitPromise resolves on the socket's `close` event — so awaiting it
+      // hung the caller forever. That is fatal for the cancellation probe,
+      // whose entire value is being bounded. A healthy peer closes in
+      // microseconds; past the grace we destroy the socket, which fires
+      // `close` and resolves exitPromise.
+      // The grace starts at `finish` — the point our own side has flushed
+      // everything `end()` queued — so destroying can never discard a write
+      // that was still on its way out.
+      let grace = null;
+      const armGrace = () => {
+        grace = setTimeout(() => this.socket?.destroy(), BROKER_CLOSE_GRACE_MS);
+        grace.unref?.();
+      };
+      if (this.socket.writableFinished) {
+        armGrace();
+      } else {
+        this.socket.once("finish", armGrace);
+      }
+      try {
+        await this.exitPromise;
+      } finally {
+        clearTimeout(grace);
+      }
+      return;
     }
     await this.exitPromise;
   }
@@ -481,7 +511,13 @@ export class AcpClient {
           brokerEndpoint = brokerSession?.endpoint ?? null;
           brokerWasReused = Boolean(brokerSession?.reused);
           if (!brokerEndpoint) {
-            throw new AcpError("Failed to start the shared agent broker.");
+            // ensureBrokerSession returns null for exactly one reason: it
+            // never acquired the broker startup lock, so it never attempted a
+            // start. Saying "failed to start" here names a cause that was
+            // never established — and sends the reader hunting a spawn bug.
+            throw new AcpError(
+              "Could not acquire the shared agent broker's startup lock; another process is holding it and no running broker was available to reuse. Nothing was started — retry the command."
+            );
           }
         }
       }

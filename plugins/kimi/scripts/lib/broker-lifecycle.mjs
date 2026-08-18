@@ -126,17 +126,25 @@ function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
-export function loadBrokerSession(cwd) {
+// KMP-32: ABSENT and UNREADABLE are different facts, and a caller that treats
+// "no endpoint" as proof that no runtime is up must not conflate them. A
+// missing record means none was ever written; a present-but-unparseable one
+// means we know nothing — the broker may be alive with a turn in flight.
+export function readBrokerSessionState(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
-    return null;
+    return { present: false, session: null };
   }
 
   try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    return { present: true, session: JSON.parse(fs.readFileSync(stateFile, "utf8")) };
   } catch {
-    return null;
+    return { present: true, session: null };
   }
+}
+
+export function loadBrokerSession(cwd) {
+  return readBrokerSessionState(cwd).session;
 }
 
 export function saveBrokerSession(cwd, session) {
@@ -198,9 +206,14 @@ function brokerLockDir(cwd) {
   return path.join(resolveStateDir(cwd), "broker.lock");
 }
 
+// How long a broker.lock may sit untouched before a waiter treats its holder
+// as crashed and steals it. Exported because ensureBrokerSession's own
+// give-up deadline MUST outlast it — see the deadline note there.
+export const BROKER_LOCK_STALE_MS = 15_000;
+
 // mkdir is atomic across processes, so it serializes concurrent broker
 // starts for one workspace. A crashed holder's stale lock is stolen after
-// 15s (its mtime stops advancing).
+// BROKER_LOCK_STALE_MS (its mtime stops advancing).
 function tryAcquireBrokerLock(cwd) {
   const lockDir = brokerLockDir(cwd);
   fs.mkdirSync(path.dirname(lockDir), { recursive: true });
@@ -213,7 +226,7 @@ function tryAcquireBrokerLock(cwd) {
     }
     try {
       const stat = fs.statSync(lockDir);
-      if (Date.now() - stat.mtimeMs > 15_000) {
+      if (Date.now() - stat.mtimeMs > BROKER_LOCK_STALE_MS) {
         fs.rmdirSync(lockDir);
         fs.mkdirSync(lockDir);
         return true;
@@ -233,8 +246,15 @@ export async function ensureBrokerSession(cwd, options = {}) {
   // The broker was spawned detached (its own process group), so the group
   // kill takes its agent child down with it.
   const killImpl = options.killProcess ?? ((pid) => terminateProcessTree(pid));
-  // Non-holders wait long enough for the holder's spawn to finish.
-  const deadline = Date.now() + (options.timeoutMs ?? 2000) + 3000;
+  // Non-holders wait long enough for the holder's spawn to finish — AND long
+  // enough to reach their own stale-lock steal. At (timeoutMs + 3000) ≈ 5s
+  // this deadline expired 10s before tryAcquireBrokerLock could steal a
+  // BROKER_LOCK_STALE_MS-old lock, so a holder killed mid-spawn left every
+  // arriving client guaranteed to fail for the next ~10s, and to fail with
+  // "Failed to start the shared agent broker" — a start it never attempted.
+  // The recovery path must be reachable before the caller gives up on it.
+  const deadline =
+    Date.now() + Math.max((options.timeoutMs ?? 2000) + 3000, BROKER_LOCK_STALE_MS + 2000);
 
   for (;;) {
     const existing = loadBrokerSession(cwd);
@@ -252,6 +272,9 @@ export async function ensureBrokerSession(cwd, options = {}) {
       }
     }
     if (Date.now() > deadline) {
+      // Truthful by construction: reaching here means the lock was never
+      // acquired, so no broker start was ever attempted. Callers must not
+      // describe this as a failed startup.
       return null;
     }
     await new Promise((resolve) => setTimeout(resolve, 50));

@@ -13,7 +13,7 @@ assert.ok(fs.existsSync(manifestPath), "Codex plugin manifest must exist at plug
 
 const manifest = readJson(manifestPath);
 assert.equal(manifest.name, "kimi");
-assert.equal(manifest.version, "0.1.5");
+assert.equal(manifest.version, "0.1.6");
 assert.equal(manifest.skills, "./skills/");
 assert.equal(manifest.repository, "https://github.com/Imperix1155/kimi-in-codex");
 for (const unsupported of ["hooks", "mcpServers", "apps"]) {
@@ -27,7 +27,7 @@ const packagedNativeSkills = fs.readdirSync(nativeSkillsRoot, { withFileTypes: t
   .sort();
 assert.deepEqual(
   packagedNativeSkills,
-  ["kimi-review", "kimi-setup", "kimi-task"],
+  ["kimi-job", "kimi-review", "kimi-setup", "kimi-task"],
   "Codex discovery must expose exactly the approved native skill set"
 );
 const packagedNativeSkillText = packagedNativeSkills
@@ -61,7 +61,21 @@ for (const document of [readme, agents, buildPlan]) {
   assert.match(document, /normal user filesystem authority/i);
   assert.match(document, /not (?:an )?OS sandbox/i);
   assert.match(document, /exact(?:-session)?(?:-only)? resume|exact session ID/i);
-  assert.match(document, /background.*durable.*deferred|durable.*background.*deferred/i);
+  // KMP-32 replaced the "background is deferred" pin. The narrower, still-true
+  // claim: background exists but is read-only, one-at-a-time, and TTL-bounded.
+  assert.match(document, /background.*read-only|read-only.*background/i);
+  assert.match(document, /one (?:background )?job at a time|one at a time/i);
+  // Pin the NUMBERS, not the word "deadline": the bare alternative was
+  // satisfied by unrelated lifecycle prose, so the pin passed even with the
+  // TTL disclosure deleted. One assertion PER NUMBER, because an alternation
+  // is satisfied by whichever number survives — deleting the default
+  // disclosure and keeping the ceiling would have left this green.
+  assert.match(document, /30[- ]minutes? (?:by )?default/i);
+  assert.match(document, /60[- ]minutes? (?:hard )?ceiling/i);
+  assert.match(document, /exact job ID|exact-id/i);
+  assert.match(document, /claim token/i);
+  // Write-enabled background remains deferred, and rescue still is too.
+  assert.match(document, /write[- ]enabled background.*(?:deferred|not|separate)/i);
   assert.match(document, /rescue.*deferred|deferred.*rescue/i);
 }
 assert.match(agents, /plugins\/kimi\/skills\/kimi-task/);
@@ -162,7 +176,19 @@ assert.match(taskSkill, /default.*read-only/i);
 assert.match(taskSkill, /normal user filesystem authority/i);
 assert.match(taskSkill, /not (?:an )?OS sandbox/i);
 assert.match(taskSkill, /--resume-session/);
-assert.match(taskSkill, /background.*not supported|not support.*background/i);
+// KMP-32 replaced the "background is not supported" pin with the bounded
+// claim the launch justification actually has to make.
+assert.match(taskSkill, /--codex-background/);
+assert.match(taskSkill, /read-only, always|sealed read-only/i, "detached jobs must be described as read-only, always");
+assert.match(taskSkill, /one at a time/i);
+assert.match(taskSkill, /30-minute default/, "the TTL default must be disclosed in the skill text");
+assert.match(taskSkill, /hard\s+ceiling is 60 minutes/, "the TTL ceiling must appear verbatim");
+assert.match(taskSkill, /KEEPS RUNNING after this call returns/, "the launch justification must state that the job outlives the call");
+assert.match(taskSkill, /never more than 60 minutes\?/, "the launch justification must state the duration ceiling");
+assert.match(taskSkill, /stored on disk/i, "the persisted prompt/result must be disclosed");
+assert.match(taskSkill, /claimToken/);
+// §11: $kimi-task references $kimi-job, and ONLY $kimi-job.
+assert.match(taskSkill, /\$kimi-job/);
 assert.doesNotMatch(taskSkill, /\$kimi-status|\$kimi-result|\$kimi-cancel/);
 assert.doesNotMatch(taskSkill, /\$ARGUMENTS|AskUserQuestion|CLAUDE_PLUGIN_ROOT/);
 
@@ -170,11 +196,58 @@ const taskMetadata = fs.readFileSync(path.join(pluginRoot, "skills", "kimi-task"
 assert.match(taskMetadata, /display_name: "Kimi Task"/);
 assert.match(taskMetadata, /\$kimi-task/);
 
+const jobSkillPath = path.join(pluginRoot, "skills", "kimi-job", "SKILL.md");
+assert.ok(fs.existsSync(jobSkillPath), "kimi-job skill must exist");
+const jobSkill = fs.readFileSync(jobSkillPath, "utf8");
+const jobFrontmatter = jobSkill.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
+assert.deepEqual(
+  jobFrontmatter.split("\n").map((line) => line.split(":", 1)[0]),
+  ["name", "description"],
+  "job skill frontmatter must contain only name and description"
+);
+// De-escalating authority class: it may inspect and stop, never grant.
+assert.match(jobSkill, /sandbox_permissions:\s*["`]require_escalated["`]/);
+assert.match(jobSkill, /starts no new work, grants Kimi no new authority/i);
+assert.match(jobSkill, /normal user filesystem authority/i);
+assert.match(jobSkill, /not (?:an )?OS sandbox/i);
+// Exact ids only — no latest-job default, no prefix guessing.
+assert.match(jobSkill, /Exact IDs only/);
+assert.match(jobSkill, /no latest-job default/i);
+assert.match(jobSkill, /no prefix matching/i);
+// Token-gated content, with sessionId named as content.
+assert.match(jobSkill, /Content is token-gated/i);
+assert.match(jobSkill, /session ID is content/i);
+assert.match(jobSkill, /Metadata is not token-gated/i);
+// Cancellation truthfulness: UNKNOWN may never be restated as cancelled.
+assert.match(jobSkill, /`UNKNOWN` means.*could not be confirmed/is);
+assert.match(jobSkill, /Never restate `UNKNOWN` as cancelled/);
+assert.match(jobSkill, /residualRisk/);
+assert.match(jobSkill, /cancel` needs no token/i);
+assert.match(jobSkill, /liveness cannot be confirmed/);
+assert.equal(
+  jobSkill.match(/node "\$\{PLUGIN_ROOT\}\/scripts\/kimi-companion\.mjs"/g)?.length,
+  1,
+  "job skill must invoke the runtime exactly once"
+);
+assert.doesNotMatch(jobSkill, /\$ARGUMENTS|AskUserQuestion|CLAUDE_PLUGIN_ROOT/);
+
+const jobMetadata = fs.readFileSync(path.join(pluginRoot, "skills", "kimi-job", "agents", "openai.yaml"), "utf8");
+assert.match(jobMetadata, /display_name: "Kimi Job"/);
+assert.match(jobMetadata, /\$kimi-job/);
+
 assert.match(manifest.description, /review/i);
 assert.match(manifest.description, /task handoff/i);
+assert.match(manifest.description, /background job/i);
 assert.match(manifest.interface.defaultPrompt.join(" "), /task handoff/i);
+assert.match(manifest.interface.defaultPrompt.join(" "), /background job/i);
 assert.match(manifest.interface.longDescription, /frozen/i);
-assert.match(manifest.interface.longDescription, /background.*lifecycle.*not included/i);
+// KMP-32 replaced "background lifecycle is not included" with the bounded
+// description of what IS included.
+assert.match(manifest.interface.longDescription, /one read-only job at a time/i);
+assert.match(manifest.interface.longDescription, /never more than 60/i);
+assert.match(manifest.interface.longDescription, /exact job ID/i);
+assert.match(manifest.interface.longDescription, /claim token/i);
+assert.match(manifest.interface.longDescription, /only when it is confirmed/i);
 assert.ok(manifest.interface.capabilities.includes("Read"));
 assert.ok(manifest.interface.capabilities.includes("Write"));
 
