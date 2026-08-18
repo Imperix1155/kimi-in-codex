@@ -1742,14 +1742,30 @@ function listLeakedTestProcesses() {
 
   for (const [label, mutate, pattern] of [
     [
+      // Narrow: this case throws "does not match" unmutated, so accepting
+      // "sealed read-only" too would let guard 3 satisfy it on its own — and
+      // the seal comparison could then be deleted wholesale with nothing red.
       "record write widened after launch",
       (record) => ({ ...record, write: true, status: "queued", pid: null }),
-      /sealed launch authority does not match|sealed read-only/i
+      /sealed launch authority does not match/i
     ],
     [
       "request payload write diverges from the sealed record",
       (record) => ({ ...record, status: "queued", pid: null, request: { ...record.request, write: true } }),
       /request payload's write authority/i
+    ],
+    [
+      // The seal's OWN case: a sealed field that no other guard inspects, so
+      // only the hash comparison can catch it. The deadline moves LATER, so
+      // the reader-side TTL reconciler cannot pre-empt the authority check.
+      "sealed ttlDeadline moved after launch",
+      (record) => ({
+        ...record,
+        status: "queued",
+        pid: null,
+        ttlDeadline: new Date(Date.parse(record.ttlDeadline) + 600_000).toISOString()
+      }),
+      /sealed launch authority does not match/i
     ]
   ]) {
     writeCodexJobFile(jobId, mutate(sealed), context);
