@@ -1547,6 +1547,74 @@ function listLeakedTestProcesses() {
   shutdownBroker(context.env, context.cwd);
 }
 
+// F7: the single-active-job precondition is enforced by a check that runs
+// INSIDE the lock hold committing the queued insert, not by a separate read
+// beforehand. Asserted against the library, because the timing half of a race
+// is not observable from a CLI test: what IS observable is that a refused
+// insert commits nothing at all — no index entry and no durable record.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const probeScript = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      const jobControl = await import(process.argv[3]);
+      const fs = await import("node:fs");
+      const workspaceRoot = process.argv[1];
+
+      const blocker = {
+        id: "task-blocker0-aaaaaa",
+        codexBackground: true,
+        status: "running",
+        phase: "running",
+        pid: process.pid,
+        write: false,
+        workspaceRoot
+      };
+      state.upsertJob(workspaceRoot, blocker);
+
+      const candidate = { id: "task-second00-bbbbbb", codexBackground: true, status: "queued", write: false, workspaceRoot };
+      const decide = (jobs) => {
+        const active = jobControl.findActiveJob(jobs);
+        return active ? "refused: " + active.id : null;
+      };
+
+      const blocked = state.insertJobUnderLock(workspaceRoot, candidate, decide);
+      const blockedFileExists = fs.existsSync(state.resolveJobFile(workspaceRoot, candidate.id));
+      const blockedIndexed = state.listJobs(workspaceRoot).some((job) => job.id === candidate.id);
+
+      // With the blocker settled, the very same insert must commit.
+      state.upsertJob(workspaceRoot, { id: blocker.id, status: "completed", phase: "done", pid: null });
+      const allowed = state.insertJobUnderLock(workspaceRoot, candidate, decide);
+      const allowedFileExists = fs.existsSync(state.resolveJobFile(workspaceRoot, candidate.id));
+
+      process.stdout.write(JSON.stringify({
+        blockedInserted: blocked.inserted, blockedRefusal: blocked.refusal,
+        blockedFileExists, blockedIndexed,
+        allowedInserted: allowed.inserted, allowedFileExists
+      }));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      probeScript,
+      context.cwd,
+      pathToImport("../scripts/lib/state.mjs"),
+      pathToImport("../scripts/lib/job-control.mjs")
+    ],
+    { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 20_000 }
+  );
+  assert.equal(probe.status, 0, `locked-insert probe failed: ${probe.stderr}`);
+  const outcome = JSON.parse(probe.stdout);
+  assert.equal(outcome.blockedInserted, false, "an active job must block the queued insert");
+  assert.match(outcome.blockedRefusal, /task-blocker0-aaaaaa/, "the refusal must name the blocking job");
+  assert.equal(outcome.blockedFileExists, false, "a refused insert must not write a durable record");
+  assert.equal(outcome.blockedIndexed, false, "a refused insert must not write an index entry");
+  assert.equal(outcome.allowedInserted, true, "the insert must commit once no job is active");
+  assert.equal(outcome.allowedFileExists, true, "a committed insert writes the durable record");
+}
+
 // §12 #5 + §14 Q1. Background launch refuses resume-by-history, refuses
 // --write (write-enabled background is a deliberate separate decision), and
 // requires --json for its machine-readable envelope.

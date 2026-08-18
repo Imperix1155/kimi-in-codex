@@ -876,12 +876,16 @@ function assertCodexBackgroundLaunchAllowed({ write, resumeLast, workspaceRoot }
   }
   // §4: the broker serializes turns, so a second background job would fail
   // at session/new. Make it an explicit precondition, not emergent behavior.
+  // This is the RECONCILING check — it also gives the caller a useful refusal
+  // before a token is minted. The binding one runs inside the insert's lock.
   const active = findActiveWorkspaceJob(workspaceRoot);
   if (active) {
-    throw new Error(
-      `Kimi job ${active.id} is already ${active.status} in this workspace. At most one background job runs at a time - check its status, or cancel it before launching another.`
-    );
+    throw new Error(buildSingleActiveJobRefusal(active));
   }
+}
+
+function buildSingleActiveJobRefusal(active) {
+  return `Kimi job ${active.id} is already ${active.status} in this workspace. At most one background job runs at a time - check its status, or cancel it before launching another.`;
 }
 
 function runCodexBackgroundLaunch(request) {
@@ -944,8 +948,19 @@ function runCodexBackgroundLaunch(request) {
       codexBackground: true
     }
   };
-  writeJobFile(workspaceRoot, jobId, queuedRecord);
-  upsertJob(workspaceRoot, queuedRecord);
+  // The single-active-job precondition is re-checked INSIDE the lock hold
+  // that inserts this record. Checking outside it (as the preflight does) is
+  // check-then-act: two concurrent launches both read "no active job", both
+  // spawn, and the loser dies at session/new with BROKER_BUSY — degrading
+  // back to the emergent broker behavior §4 says must be an explicit
+  // precondition.
+  const insert = insertJobUnderLock(workspaceRoot, queuedRecord, (jobs) => {
+    const active = findActiveJob(jobs);
+    return active ? buildSingleActiveJobRefusal(active) : null;
+  });
+  if (!insert.inserted) {
+    throw new Error(insert.refusal);
+  }
 
   const child = spawnDetachedCodexWorker(cwd, jobId);
   // Index-only pid patch: the worker rewrites its own job file at startup,
