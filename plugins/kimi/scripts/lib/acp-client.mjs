@@ -442,8 +442,19 @@ class BrokerAcpClient extends AcpClientBase {
       // whose entire value is being bounded. A healthy peer closes in
       // microseconds; past the grace we destroy the socket, which fires
       // `close` and resolves exitPromise.
-      const grace = setTimeout(() => this.socket?.destroy(), BROKER_CLOSE_GRACE_MS);
-      grace.unref?.();
+      // The grace starts at `finish` — the point our own side has flushed
+      // everything `end()` queued — so destroying can never discard a write
+      // that was still on its way out.
+      let grace = null;
+      const armGrace = () => {
+        grace = setTimeout(() => this.socket?.destroy(), BROKER_CLOSE_GRACE_MS);
+        grace.unref?.();
+      };
+      if (this.socket.writableFinished) {
+        armGrace();
+      } else {
+        this.socket.once("finish", armGrace);
+      }
       try {
         await this.exitPromise;
       } finally {

@@ -24,10 +24,14 @@ const CLI = fileURLToPath(new URL("../scripts/kimi-companion.mjs", import.meta.u
 // KMP-32 added detached-worker scenarios: each launches a real broker and
 // agent, so the bound is higher — but it stays a HARD bound, because a hung
 // background job and a slow one look identical from here.
+// A HARD bound, but a generous one: shared CI runners are several times
+// slower than a dev machine, and a deadman tuned to local wall-clock reports
+// runner load as a hang. It exists so a genuinely wedged background job is
+// distinguishable from a slow one, which a 7-minute ceiling still does.
 const deadman = setTimeout(() => {
-  console.error("COMPANION-TESTS TIMEOUT after 240s");
+  console.error("COMPANION-TESTS TIMEOUT after 420s");
   process.exit(2);
-}, 240_000);
+}, 420_000);
 deadman.unref?.();
 
 function makeEnv(scenario, pluginData) {
@@ -355,7 +359,7 @@ function pathToImport(relative) {
     const status = runCli(["status", jobId, "--json"], { env, cwd });
     const snapshot = status.status === 0 ? JSON.parse(status.stdout) : null;
     return snapshot?.job.status === "running" ? snapshot : null;
-  }, 10_000);
+  }, 30_000);
   assert.ok(running, "background job never started running");
 
   const concurrent = runCli(["task", "second thing"], { env, cwd });
@@ -404,7 +408,7 @@ function pathToImport(relative) {
   // session/new — a fixture "cancellable" prompt would hold by design, so a
   // follow-up task is the wrong instrument here.
   const probeScript = `
-    const deadman = setTimeout(() => process.exit(3), 5000);
+    const deadman = setTimeout(() => process.exit(3), 30000);
     (async () => {
       const { AcpClient } = await import(process.argv[2]);
       const { loadBrokerSession } = await import(process.argv[3]);
@@ -417,14 +421,21 @@ function pathToImport(relative) {
       process.exit(0);
     })().catch(() => process.exit(5));
   `;
+  // BOUNDS, not measurements: every number here exists only so a hung broker
+  // fails instead of hanging the suite. A shared CI runner is 5-10x slower
+  // than this machine, and a bound tuned to local speed turns runner load into
+  // a "broker stayed busy" verdict it never earned (observed on PR #4 CI).
+  // Nothing in the KMP-32 diff touches the legacy cancel path's busy release:
+  // the Codex reconciler, cancel, and lock helpers are all gated on
+  // codexBackground / --codex-job.
   const probeOk = await pollUntil(() => {
     const probe = spawnSync(
       process.execPath,
       ["-e", probeScript, cwd, pathToImport("../scripts/lib/acp-client.mjs"), pathToImport("../scripts/lib/broker-lifecycle.mjs")],
-      { env, cwd, encoding: "utf8", timeout: 10_000 }
+      { env, cwd, encoding: "utf8", timeout: 60_000 }
     );
     return probe.status === 0 ? true : null;
-  }, 10_000, 500);
+  }, 60_000, 500);
   assert.ok(probeOk, "broker stayed busy after cancel");
   shutdownBroker(env, cwd);
 }
@@ -2292,13 +2303,17 @@ function listLeakedTestProcesses() {
 // `failed` with a cancellation message the user never requested. The deadline
 // must still be what the record names.
 {
-  const context = makeBackgroundWorkspace("cancel-ignored");
+  const startMarker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kmc-ttl-")), "agent-started.txt");
+  const context = makeBackgroundWorkspace("cancel-ignored", { KIMI_FAKE_START_MARKER: startMarker });
   const launch = launchBackground(["a turn that outlives its deadline"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const jobId = launch.payload.jobId;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 30_000), "job never reached running");
 
   // Reclaim the sealed record, then stop the first run's worker and runtime.
+  // The runtime MUST go: this fixture ignores session/cancel, so the broker
+  // would still be holding the dead socket's turn and refuse the requeued
+  // worker's session/new with BROKER_BUSY.
   const record = readCodexJobFile(jobId, context);
   if (Number.isFinite(record.pid)) {
     try {
@@ -2311,6 +2326,16 @@ function listLeakedTestProcesses() {
   // A deadline that falls DURING the turn, not before it: an already-past
   // deadline fires the timer at 0ms and aborts before the prompt starts,
   // which is a different sub-path from the wedged-agent one under test.
+  //
+  // The margin has to cover a COLD START — the requeued worker spawns a fresh
+  // broker and agent, and the deadline is sealed before any of that begins.
+  // At 1500ms a loaded CI runner spent the whole budget on broker startup and
+  // the worker died with "Failed to start the shared agent broker", which
+  // attributeTtlExpiry rightly refuses to relabel (observed on PR #4 CI).
+  // Cold start is bounded above by the 30s launch poll this test already
+  // uses, so the margin is set well inside that and the two oracles below
+  // make a mis-target LOUD instead of silent.
+  const ttlMarginMs = 15_000;
   const requeued = resealCodexJobRecord(
     {
       ...record,
@@ -2321,14 +2346,30 @@ function listLeakedTestProcesses() {
       errorMessage: null,
       result: null,
       rendered: null,
-      ttlDeadline: new Date(Date.now() + 1500).toISOString()
+      ttlDeadline: new Date(Date.now() + ttlMarginMs).toISOString()
     },
     context
   );
   writeCodexJobFile(jobId, requeued, context);
 
+  fs.rmSync(startMarker, { force: true });
+  const workerStartedAt = Date.now();
   const worker = runCli(["task-worker", "--job-id", jobId, "--cwd", context.cwd], context);
+  const workerElapsed = Date.now() - workerStartedAt;
   assert.notEqual(worker.status, 0, "a turn killed by its deadline is not a success");
+
+  // Oracle 1: the agent actually started, so the broker came up and the
+  // wedged-agent sub-path is the one that ran.
+  assert.equal(
+    fs.existsSync(startMarker),
+    true,
+    `the turn never started, so this run did not exercise the deadline path: ${worker.stderr}`
+  );
+  // Oracle 2: the worker lived until its deadline rather than dying early.
+  assert.ok(
+    workerElapsed >= ttlMarginMs * 0.8,
+    `the worker exited after ${workerElapsed}ms, well before its ${ttlMarginMs}ms deadline: ${worker.stderr}`
+  );
 
   const settled = readCodexJobFile(jobId, context);
   assert.equal(settled.status, "failed", "an expired job is `failed`, never `cancelled`");
@@ -2527,7 +2568,20 @@ function listLeakedTestProcesses() {
 
   // Mid-window: the worker records a normal completion, exactly as it would
   // have had the turn ended a moment after the cancel was requested.
-  await new Promise((resolve) => setTimeout(resolve, 1500));
+  //
+  // OBSERVED, not timed. A fixed sleep encodes a margin against
+  // CANCEL_CONFIRM_WINDOW_MS, a constant this test does not own: too short and
+  // the completion lands before the cancel's step-1 write (a different case),
+  // too long and it lands after the window closed. Waiting for the durable
+  // record to actually read `cancel-requested` puts the write inside the
+  // window by construction, at whatever speed the machine runs.
+  const { CANCEL_CONFIRM_WINDOW_MS } = await import(new URL("../scripts/lib/codex-jobs.mjs", import.meta.url));
+  const cancelRequested = await pollUntil(
+    () => (readCodexJobFile(jobId, context).status === "cancel-requested" ? true : null),
+    CANCEL_CONFIRM_WINDOW_MS,
+    100
+  );
+  assert.ok(cancelRequested, "the cancel never recorded its intent, so there is no window to land inside");
   writeCodexJobFile(
     jobId,
     {
