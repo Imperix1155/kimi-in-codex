@@ -219,6 +219,36 @@ function upsertCodexJobIndex(jobId, patch, { env, cwd }) {
   assert.equal(probe.status, 0, `could not patch job index ${jobId}: ${probe.stderr}`);
 }
 
+// The broker STARTUP lock, read through the real resolver. A holder killed
+// mid-spawn leaves this behind, and until it goes stale every client that
+// wants a broker is walled out — so a test that is about to cold-start one
+// has to be able to assert it is gone.
+function readBrokerStartupState({ env, cwd }) {
+  const script = `
+    (async () => {
+      const fs = await import("node:fs");
+      const path = await import("node:path");
+      const state = await import(process.argv[2]);
+      const broker = await import(process.argv[3]);
+      const stateDir = state.resolveStateDir(process.argv[1]);
+      const lockDir = path.join(stateDir, "broker.lock");
+      const session = broker.loadBrokerSession(process.argv[1]);
+      let pointerAlive = false;
+      if (session?.pid) {
+        try { process.kill(session.pid, 0); pointerAlive = true; } catch (error) { pointerAlive = error?.code === "EPERM"; }
+      }
+      process.stdout.write(JSON.stringify({ lockHeld: fs.existsSync(lockDir), pointer: session?.endpoint ?? null, pointerAlive }));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", script, cwd, pathToImport("../scripts/lib/state.mjs"), pathToImport("../scripts/lib/broker-lifecycle.mjs")],
+    { env, cwd, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(probe.status, 0, `could not read broker startup state: ${probe.stderr}`);
+  return JSON.parse(probe.stdout);
+}
+
 // Re-seals a mutated record with the REAL computeAuthoritySeal, so a test
 // that legitimately needs to change a sealed field (e.g. to bring a TTL
 // deadline within test time) stays subject to the seal rather than
@@ -2391,11 +2421,22 @@ function listLeakedTestProcesses() {
   assert.equal(launch.status, 0, launch.stderr);
   const jobId = launch.payload.jobId;
   assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 30_000), "job never reached running");
+  // `running` is NOT proof the broker exists: runTrackedJob writes it before
+  // it opens a client, so a worker killed on that signal can still be inside
+  // ensureBrokerSession HOLDING the broker startup lock — which it then never
+  // releases, walling out the requeued worker below. The agent's start marker
+  // is the real signal: it is written after the broker is up and the lock
+  // released. (This is what failed on PR #4 CI, run 32128776148.)
+  assert.ok(
+    await pollUntil(() => (fs.existsSync(startMarker) ? true : null), 30_000, 100),
+    "the first run's agent never started, so the broker lock may still be held"
+  );
 
   // Reclaim the sealed record, then stop the first run's worker and runtime.
   // The runtime MUST go: this fixture ignores session/cancel, so the broker
   // would still be holding the dead socket's turn and refuse the requeued
-  // worker's session/new with BROKER_BUSY.
+  // worker's session/new with BROKER_BUSY. That is why this block cold-starts
+  // a second broker instead of reusing the first.
   const record = readCodexJobFile(jobId, context);
   if (Number.isFinite(record.pid)) {
     try {
@@ -2435,6 +2476,25 @@ function listLeakedTestProcesses() {
   writeCodexJobFile(jobId, requeued, context);
 
   fs.rmSync(startMarker, { force: true });
+
+  // HARD PRECONDITION. The requeued worker must be able to cold-start a
+  // broker, which means nothing may be holding the startup lock and no dead
+  // pointer may be left to chase. Asserted rather than assumed so a
+  // regression names itself here instead of surfacing as an unexplained
+  // "could not acquire the broker's startup lock" fifteen seconds later.
+  const brokerState = await pollUntil(
+    () => {
+      const seen = readBrokerStartupState(context);
+      return !seen.lockHeld && !seen.pointerAlive ? seen : null;
+    },
+    30_000,
+    250
+  );
+  assert.ok(
+    brokerState,
+    `the broker startup lock or a live broker outlived the shutdown: ${JSON.stringify(readBrokerStartupState(context))}`
+  );
+
   // Anchored to the SEALED value, not to a stopwatch started here: the write
   // and the spawn between sealing and running cost real time on a loaded
   // runner, and an elapsed-since-here oracle would silently absorb it.
