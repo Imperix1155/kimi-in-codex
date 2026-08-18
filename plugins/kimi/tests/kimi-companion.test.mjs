@@ -1666,9 +1666,21 @@ function listLeakedTestProcesses() {
   assert.match(missingJson.stderr, /--json/);
 
   // §14 Q2 boundary: exactly the 60-minute ceiling is accepted, default is 30.
-  const { resolveTtlMinutes } = await import(new URL("../scripts/lib/codex-jobs.mjs", import.meta.url));
+  const { resolveTtlMinutes, isPastTtlDeadline } = await import(
+    new URL("../scripts/lib/codex-jobs.mjs", import.meta.url)
+  );
   assert.equal(resolveTtlMinutes("60"), 60, "the 60-minute ceiling itself must be accepted");
   assert.equal(resolveTtlMinutes(null), 30, "unset TTL must default to 30 minutes");
+
+  // The deadline is a PROMISE to the user, so it is expired AT the stated
+  // instant, not one millisecond after it. An exclusive comparison leaves a
+  // reader that arrives exactly on time treating a wedged worker as live.
+  const deadline = "2026-08-17T12:00:00.000Z";
+  const deadlineMs = Date.parse(deadline);
+  assert.equal(isPastTtlDeadline({ ttlDeadline: deadline }, deadlineMs - 1), false, "before the deadline is not expired");
+  assert.equal(isPastTtlDeadline({ ttlDeadline: deadline }, deadlineMs), true, "AT the deadline the job is expired");
+  assert.equal(isPastTtlDeadline({ ttlDeadline: deadline }, deadlineMs + 1), true, "after the deadline is expired");
+  assert.equal(isPastTtlDeadline({ ttlDeadline: "not a date" }, deadlineMs), false, "an unparseable deadline never expires");
 
   // Nothing above may have created a job.
   const list = runCli(["status", "--codex-jobs", "--json"], context);

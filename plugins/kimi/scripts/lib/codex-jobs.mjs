@@ -155,9 +155,12 @@ export function computeTtlDeadline(ttlMinutes, from = Date.now()) {
   return new Date(from + minutes * 60_000).toISOString();
 }
 
+// Inclusive at the boundary: `ttlDeadline` is the instant the grant ENDS, and
+// it is a stated promise to the user. A reader arriving exactly on time must
+// enforce it, not wait for the next read.
 export function isPastTtlDeadline(record, now = Date.now()) {
   const deadline = Date.parse(record.ttlDeadline ?? "");
-  return Number.isFinite(deadline) && now > deadline;
+  return Number.isFinite(deadline) && now >= deadline;
 }
 
 // Coarse metadata: everything a caller needs to FIND the job it wants to
