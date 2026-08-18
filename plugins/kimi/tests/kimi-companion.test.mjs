@@ -168,6 +168,40 @@ function writeCodexJobFile(jobId, record, { env, cwd }) {
   assert.equal(probe.status, 0, `could not write job record ${jobId}: ${probe.stderr}`);
 }
 
+// The durable record and the index are written SEPARATELY by the worker, and
+// the gap between those two writes is a real observable state. These two
+// helpers reproduce each half on its own, so a test can construct the gap
+// instead of racing it.
+function writeCodexJobFileOnly(jobId, record, { env, cwd }) {
+  const script = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      state.writeJobFile(process.argv[1], process.argv[3], JSON.parse(process.argv[4]));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", script, cwd, pathToImport("../scripts/lib/state.mjs"), jobId, JSON.stringify(record)],
+    { env, cwd, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(probe.status, 0, `could not write job record ${jobId}: ${probe.stderr}`);
+}
+
+function upsertCodexJobIndex(jobId, patch, { env, cwd }) {
+  const script = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      state.upsertJob(process.argv[1], { ...JSON.parse(process.argv[4]), id: process.argv[3] });
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", script, cwd, pathToImport("../scripts/lib/state.mjs"), jobId, JSON.stringify(patch)],
+    { env, cwd, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(probe.status, 0, `could not patch job index ${jobId}: ${probe.stderr}`);
+}
+
 async function pollCodexJobStatus(jobId, wanted, context, timeoutMs = 25_000) {
   return pollUntil(() => {
     const snapshot = codexStatus(jobId, context);
@@ -1931,6 +1965,76 @@ function listLeakedTestProcesses() {
       process.kill(workerPid, "SIGKILL");
     } catch {}
   }
+  shutdownBroker(context.env, context.cwd);
+}
+
+// Invariant C, the case the settled-guard above CANNOT see: the record goes
+// terminal BEFORE the cancel's step-1 write, not during the confirmation
+// window. The worker settles in two writes (durable record, then index), so
+// in that gap the index still says `running` while the record says
+// `completed`. A cancel that trusts the index alone passes its active gate,
+// its unconditional step-1 write overwrites the settled record with
+// `cancel-requested`, and the guard then re-reads the very file the cancel
+// just corrupted — reporting a CONFIRMED cancellation of work that finished.
+//
+// Deterministic by construction (no racing): the two worker writes are
+// replayed by hand with the cancel starting in between.
+{
+  const context = makeBackgroundWorkspace("cancel-ignored");
+  const launch = launchBackground(["a turn that settles before the cancel"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId, claimToken } = launch.payload;
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+
+  const record = readCodexJobFile(jobId, context);
+  // The turn is over and its worker is gone, exactly as it would be a moment
+  // after a normal completion.
+  if (Number.isFinite(record.pid)) {
+    try {
+      process.kill(record.pid, "SIGKILL");
+    } catch {}
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  // Worker write 1 of 2: the durable record is settled `completed`.
+  writeCodexJobFileOnly(
+    jobId,
+    {
+      ...record,
+      status: "completed",
+      phase: "done",
+      pid: null,
+      completedAt: new Date().toISOString(),
+      result: { status: 0, stopReason: "end_turn", sessionId: "sess-1", rawOutput: "SETTLED-BEFORE-CANCEL" },
+      rendered: "SETTLED-BEFORE-CANCEL\n"
+    },
+    context
+  );
+  // Worker write 2 of 2 has NOT happened yet: the index still reads `running`
+  // against a pid that no longer exists.
+  upsertCodexJobIndex(jobId, { status: "running", phase: "running", pid: null }, context);
+
+  const cancel = runCli(["cancel", "--codex-job", jobId, "--json"], context);
+  const payload = JSON.parse(cancel.stdout);
+  assert.notEqual(
+    payload.cancelStatus,
+    "CANCELLED",
+    `a job that settled before the cancel must never be reported cancelled: ${cancel.stdout}`
+  );
+  assert.equal(payload.confirmed, false, "no cancellation was confirmed; nothing was stopped");
+  assert.equal(payload.status, "completed", `a settled job's state must be reported as-is: ${cancel.stdout}`);
+
+  const after = readCodexJobFile(jobId, context);
+  assert.equal(after.status, "completed", "the cancel must not overwrite a settled durable record");
+  assert.equal(after.errorMessage ?? null, null, "a completed job must not acquire a cancellation message");
+
+  // Worker write 2 of 2 finally lands, closing the gap. The end state must be
+  // an intact completed job whose result is still readable.
+  upsertCodexJobIndex(jobId, { status: "completed", phase: "done", pid: null }, context);
+  assert.equal(codexStatus(jobId, context).payload.job.status, "completed");
+  const result = runCli(["result", "--codex-job", jobId, "--claim", claimToken, "--json"], context);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(JSON.parse(result.stdout).result.rawOutput, /SETTLED-BEFORE-CANCEL/);
   shutdownBroker(context.env, context.cwd);
 }
 

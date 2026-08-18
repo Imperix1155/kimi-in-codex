@@ -174,6 +174,26 @@ function isActiveCodexJobStatus(status) {
   return status === "queued" || status === "running" || status === "cancel-requested";
 }
 
+// KMP-32 F1: NEITHER source is authoritative on its own. The worker settles a
+// job in two writes — the durable record first, the index second — so the
+// index is stale during the gap; the reconciler patches the index, so the
+// durable record is stale on that path. A job is SETTLED as soon as either
+// says so, and reading only one is how a cancel comes to overwrite a
+// `completed` record and report a confirmed cancellation of finished work.
+export function settledCodexJobStatus(stored, indexed) {
+  for (const record of [stored, indexed]) {
+    const status = record?.status;
+    if (status && !isActiveCodexJobStatus(status)) {
+      return status;
+    }
+  }
+  return null;
+}
+
+export function findActiveJob(jobs) {
+  return sortJobsNewestFirst(jobs).find((job) => isActiveCodexJobStatus(job.status)) ?? null;
+}
+
 // Exact ids only, and only Codex background records. There is no
 // "latest job" default anywhere on the Codex surface.
 export function resolveCodexBackgroundJob(cwd, jobId, options = {}) {
@@ -190,8 +210,10 @@ export function resolveCodexBackgroundJob(cwd, jobId, options = {}) {
     );
   }
   // The index carries the freshest status (the reconciler and concurrent
-  // writers patch it); the durable record carries the result payload.
-  return { workspaceRoot, job: { ...stored, ...(indexed ?? {}), id: jobId } };
+  // writers patch it); the durable record carries the result payload. Both
+  // are returned UNMERGED as well, because the merged view hides a terminal
+  // status that only one of them has seen yet (see settledCodexJobStatus).
+  return { workspaceRoot, job: { ...stored, ...(indexed ?? {}), id: jobId }, stored, indexed };
 }
 
 export function listCodexBackgroundJobs(cwd, options = {}) {
@@ -205,9 +227,7 @@ export function listCodexBackgroundJobs(cwd, options = {}) {
 
 export function findActiveWorkspaceJob(workspaceRoot, options = {}) {
   reconcileActiveJobs(workspaceRoot, options);
-  return (
-    sortJobsNewestFirst(listJobs(workspaceRoot)).find((job) => isActiveCodexJobStatus(job.status)) ?? null
-  );
+  return findActiveJob(listJobs(workspaceRoot));
 }
 
 function getCurrentSessionId(options = {}) {

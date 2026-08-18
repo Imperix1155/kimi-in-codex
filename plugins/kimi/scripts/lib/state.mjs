@@ -305,6 +305,79 @@ export function listJobs(cwd) {
   return loadState(cwd).jobs;
 }
 
+// KMP-32 F1/F7: a job's truth lives in TWO places — the durable record and
+// the index — written by launcher, worker, and cancel processes at once.
+// Deciding from a read and then writing is how a cancel overwrites a job
+// that settled a millisecond earlier, and how two launches both see "no
+// active job". These two helpers run the DECISION inside the same lock hold
+// that commits it, so no writer can land in between.
+//
+// They deliberately do not call upsertJob/saveState: those take the lock
+// themselves, and re-entering it would stall for the full 2s lock timeout.
+
+function applyJobPatchUnlocked(state, jobId, patch) {
+  const timestamp = nowIso();
+  const existingIndex = state.jobs.findIndex((job) => job.id === jobId);
+  if (existingIndex === -1) {
+    state.jobs.unshift({ createdAt: timestamp, updatedAt: timestamp, ...patch, id: jobId });
+    return;
+  }
+  state.jobs[existingIndex] = {
+    ...state.jobs[existingIndex],
+    ...patch,
+    id: jobId,
+    updatedAt: timestamp
+  };
+}
+
+// `decide` receives the freshest {stored, indexed} view and returns a patch
+// to apply to BOTH, or null to abort the write. The pre-write view is
+// returned either way, so a caller that aborted can report what it saw.
+export function patchJobUnderLock(cwd, jobId, decide) {
+  const lock = acquireStateLock(cwd);
+  try {
+    const jobFile = resolveJobFile(cwd, jobId);
+    const stored = fs.existsSync(jobFile) ? readJobFile(jobFile) : null;
+    const state = loadState(cwd);
+    const indexed = state.jobs.find((job) => job.id === jobId) ?? null;
+
+    const patch = decide({ stored, indexed });
+    if (!patch) {
+      return { applied: false, stored, indexed };
+    }
+
+    if (stored) {
+      writeJobFile(cwd, jobId, { ...stored, ...patch, id: jobId });
+    }
+    applyJobPatchUnlocked(state, jobId, patch);
+    saveStateUnlocked(cwd, state);
+    return { applied: true, stored, indexed };
+  } finally {
+    releaseStateLock(lock);
+  }
+}
+
+// `decide` receives the freshest job list and returns a refusal message, or
+// null to commit `record`. The check and the insert share one lock hold, so
+// a second launch cannot pass the same precondition concurrently.
+export function insertJobUnderLock(cwd, record, decide) {
+  const lock = acquireStateLock(cwd);
+  try {
+    const state = loadState(cwd);
+    const refusal = decide(state.jobs);
+    if (refusal) {
+      return { inserted: false, refusal };
+    }
+
+    writeJobFile(cwd, record.id, record);
+    applyJobPatchUnlocked(state, record.id, record);
+    saveStateUnlocked(cwd, state);
+    return { inserted: true, refusal: null };
+  } finally {
+    releaseStateLock(lock);
+  }
+}
+
 export function setConfig(cwd, key, value) {
   return updateState(cwd, (state) => {
     state.config = {

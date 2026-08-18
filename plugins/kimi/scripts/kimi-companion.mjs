@@ -48,11 +48,21 @@ import {
 } from "./lib/kimi.mjs";
 import { interpolateTemplate, loadPromptTemplate } from "./lib/prompts.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
-import { generateJobId, getConfig, listJobs, setConfig, upsertJob, writeJobFile } from "./lib/state.mjs";
+import {
+  generateJobId,
+  getConfig,
+  insertJobUnderLock,
+  listJobs,
+  patchJobUnderLock,
+  setConfig,
+  upsertJob,
+  writeJobFile
+} from "./lib/state.mjs";
 import {
   attributeTtlExpiry,
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  findActiveJob,
   findActiveWorkspaceJob,
   listCodexBackgroundJobs,
   readJobProgressPreview,
@@ -60,6 +70,7 @@ import {
   resolveCancelableJob,
   resolveCodexBackgroundJob,
   resolveResultJob,
+  settledCodexJobStatus,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
 import {
@@ -1048,12 +1059,37 @@ function runCodexJobResult(options) {
   );
 }
 
-function writeCodexJobPatch(workspaceRoot, jobId, patch) {
-  const stored = readStoredJob(workspaceRoot, jobId);
-  if (stored) {
-    writeJobFile(workspaceRoot, jobId, { ...stored, ...patch, id: jobId });
-  }
-  upsertJob(workspaceRoot, { id: jobId, ...patch });
+// Every cancel write is conditional on the job still being UNSETTLED, and the
+// condition is evaluated inside the same lock hold that commits the write.
+// An unconditional read-modify-write here is what let a cancel overwrite a
+// record that had already settled (F1): the check and the write were separate,
+// and the durable record — the guard's own evidence — was what got corrupted.
+function patchCodexJobIfUnsettled(workspaceRoot, jobId, patch) {
+  return patchJobUnderLock(workspaceRoot, jobId, ({ stored, indexed }) =>
+    settledCodexJobStatus(stored, indexed) ? null : patch
+  );
+}
+
+// A cancel that finds the job already settled reports that state as-is. It
+// never invents a verdict: "the session is gone" is evidence of COMPLETION
+// here, not of cancellation.
+function outputSettledCancel(jobId, status, { signalled }) {
+  const cancelled = status === "cancelled";
+  outputResult(
+    {
+      cancelStatus: cancelled ? "CANCELLED" : "NOT ACTIVE",
+      jobId,
+      status,
+      confirmed: cancelled,
+      detail: cancelled
+        ? "Cancellation confirmed: the worker recorded a cancelled stop reason."
+        : signalled
+          ? `Job ${jobId} reached ${status} on its own before the cancellation took effect; its recorded result was left intact.`
+          : `Job ${jobId} is already ${status}; nothing was signalled.`,
+      residualRisk: null
+    },
+    true
+  );
 }
 
 // Invariant C, the single most important rule in this phase: no invocation
@@ -1067,37 +1103,36 @@ function writeCodexJobPatch(workspaceRoot, jobId, patch) {
 async function runCodexJobCancel(options) {
   const cwd = resolveCommandCwd(options);
   const jobId = assertJobId(options["codex-job"]);
-  const { workspaceRoot, job } = resolveCodexBackgroundJob(cwd, jobId);
+  const { workspaceRoot, job, stored, indexed } = resolveCodexBackgroundJob(cwd, jobId);
   // Cancel is deliberately token-free (owner decision Q3): termination
   // de-escalates, and a job with no reachable off switch is the worse
-  // failure. It still may not read content.
-  if (options.claim != null && options.claim !== "") {
-    authenticateCodexClaim(job, options.claim, { required: false, operation: "cancel" });
-  }
+  // failure. A supplied --claim is IGNORED outright rather than validated:
+  // validating it would refuse the one operation with no off-switch on a
+  // typo, and would turn cancel into a claim-token oracle (right token
+  // proceeds, wrong token errors) for a caller who never reads content.
 
-  if (!isActiveCodexStatus(job.status)) {
-    outputResult(
-      {
-        cancelStatus: job.status === "cancelled" ? "CANCELLED" : "NOT ACTIVE",
-        jobId,
-        status: job.status,
-        confirmed: job.status === "cancelled",
-        detail: `Job ${jobId} is already ${job.status}; nothing was signalled.`,
-        residualRisk: null
-      },
-      true
-    );
+  // Terminal in EITHER source is terminal. Trusting only the merged view —
+  // where the index wins — reads `running` from a stale index while the
+  // durable record already says `completed`.
+  const alreadySettled = settledCodexJobStatus(stored, indexed);
+  if (alreadySettled) {
+    outputSettledCancel(jobId, alreadySettled, { signalled: false });
     return;
   }
 
   const sessionId = job.threadId ?? null;
-  // Step 1: record the INTENT. Never a terminal state.
+  // Step 1: record the INTENT. Never a terminal state — and never over a job
+  // that settled between the check above and this write.
   const cancelRequestedAt = nowIso();
-  writeCodexJobPatch(workspaceRoot, jobId, {
+  const requested = patchCodexJobIfUnsettled(workspaceRoot, jobId, {
     status: "cancel-requested",
     phase: "cancel-requested",
     cancelRequestedAt
   });
+  if (!requested.applied) {
+    outputSettledCancel(jobId, settledCodexJobStatus(requested.stored, requested.indexed), { signalled: false });
+    return;
+  }
   appendLogLine(job.logFile, `Cancellation requested for session ${sessionId ?? "(none recorded)"}.`);
 
   const cancel = await cancelKimiSession(cwd, { sessionId });
@@ -1148,45 +1183,25 @@ async function runCodexJobCancel(options) {
   // evidence of completion, not of cancellation. Writing `cancelled` here
   // would destroy the user's recorded result and mislabel the turn, the
   // same mislabeling class runTrackedJob guards in the other direction.
-  const settled = readStoredJob(workspaceRoot, jobId) ?? {};
-  if (settled.status === "cancelled") {
-    outputResult(
-      {
-        cancelStatus: "CANCELLED",
-        jobId,
-        status: "cancelled",
-        confirmed: true,
-        detail: "Cancellation confirmed: the worker recorded a cancelled stop reason.",
-        residualRisk: null
-      },
-      true
-    );
-    return;
-  }
-  if (settled.status && !isActiveCodexStatus(settled.status)) {
-    outputResult(
-      {
-        cancelStatus: "NOT ACTIVE",
-        jobId,
-        status: settled.status,
-        confirmed: false,
-        detail: `Job ${jobId} reached ${settled.status} on its own before the cancellation took effect; its recorded result was left intact.`,
-        residualRisk: null
-      },
-      true
-    );
-    return;
-  }
-
+  // The settled-check is re-evaluated INSIDE the write's lock hold, so a
+  // completion landing after this point still wins.
   if (confirmedBy) {
-    appendLogLine(job.logFile, `Cancellation confirmed: ${confirmedBy}.`);
-    writeCodexJobPatch(workspaceRoot, jobId, {
+    const confirmedWrite = patchCodexJobIfUnsettled(workspaceRoot, jobId, {
       status: "cancelled",
       phase: "cancelled",
       pid: null,
       completedAt,
       errorMessage: `Cancelled by user; confirmed because ${confirmedBy}.`
     });
+    if (!confirmedWrite.applied) {
+      outputSettledCancel(
+        jobId,
+        settledCodexJobStatus(confirmedWrite.stored, confirmedWrite.indexed),
+        { signalled: true }
+      );
+      return;
+    }
+    appendLogLine(job.logFile, `Cancellation confirmed: ${confirmedBy}.`);
     outputResult(
       {
         cancelStatus: "CANCELLED",
@@ -1202,14 +1217,20 @@ async function runCodexJobCancel(options) {
   }
 
   const residualRisk = buildResidualRiskMessage(job.write === true);
-  appendLogLine(job.logFile, `Cancellation unconfirmed: ${probeDetail}.`);
-  writeCodexJobPatch(workspaceRoot, jobId, {
+  const unknownWrite = patchCodexJobIfUnsettled(workspaceRoot, jobId, {
     status: "unknown",
     phase: "unknown",
     pid: null,
     completedAt,
     errorMessage: residualRisk
   });
+  if (!unknownWrite.applied) {
+    // Nothing is unconfirmed: the job settled on its own. Exit 0 — the
+    // nonzero exit below means "this cancel could not be shown to work".
+    outputSettledCancel(jobId, settledCodexJobStatus(unknownWrite.stored, unknownWrite.indexed), { signalled: true });
+    return;
+  }
+  appendLogLine(job.logFile, `Cancellation unconfirmed: ${probeDetail}.`);
   outputResult(
     {
       cancelStatus: "UNKNOWN",
