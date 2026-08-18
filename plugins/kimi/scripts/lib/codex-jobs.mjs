@@ -17,8 +17,11 @@ import os from "node:os";
 export const CODEX_JOB_ID_PATTERN = /^(task|review)-[0-9a-z]+-[0-9a-z]{6}$/;
 
 // Owner decision Q2 (2026-08-17): 30-minute default, 60-minute hard
-// ceiling. --ttl-minutes may only LOWER the default. Both numbers are a
-// stated promise to the user and appear verbatim in the launch consent text.
+// ceiling. --ttl-minutes accepts 1-60, so it may raise above the default as
+// well as lower it; only the CEILING is absolute (the "may only lower it"
+// wording in the design brief's §6 is pre-ratification and superseded by its
+// §14). Both numbers are a stated promise to the user and appear verbatim in
+// the launch consent text.
 export const DEFAULT_TTL_MINUTES = 30;
 export const HARD_CEILING_TTL_MINUTES = 60;
 

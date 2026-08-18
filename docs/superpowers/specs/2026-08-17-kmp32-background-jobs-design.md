@@ -1,6 +1,8 @@
 # KMP-32 Design Brief — Codex-native status, result, cancellation, and background-job recovery
 
-**Status:** design only, awaiting OWNER review before implementation. Drafted 2026-08-17 on branch `codex/kmp32-orchestration` (checkpoint base `aa17c72`). Key code claims spot-verified against this worktree.
+**Status:** ratified and implemented. Drafted 2026-08-17 on branch `codex/kmp32-orchestration` (checkpoint base `aa17c72`); the owner's answers to §13 were ratified the same day and are recorded in [§14](#14-owner-decisions-ratified-2026-08-17). Key code claims spot-verified against this worktree.
+
+> **Reading order.** §§1–13 are the pre-ratification design record and are kept as written — they are the reasoning the decisions were made against, not the contract. **§14 is the ratified contract, and where the two conflict §14 controls.** The shipped behaviour lives in [`AGENTS.md`](../../../AGENTS.md) (runtime contracts) and [`docs/PLAN.md`](../../PLAN.md) (architecture, port scope, gates, deferred surfaces). Conflicts are flagged inline below.
 
 ---
 
@@ -38,6 +40,8 @@ status --codex-job <exact-id> [--claim <token>] --json
 result --codex-job <exact-id>  --claim <token>  --json
 cancel --codex-job <exact-id> [--claim <token>] --json
 ```
+
+> **Superseded by §14.** `--write` is *refused* on `--codex-background` (§14 Q1: read-only background only), and a `--claim` passed to `cancel` is ignored outright rather than validated (§14 Q3 corollary). The flag shapes above are otherwise as shipped.
 
 `--codex-background` and `--codex-job` gate entry into new handlers (`runCodexBackgroundLaunch`, `runCodexJobStatus`, `runCodexJobResult`, `runCodexJobCancel`) exactly as `--codex-once` gates `runCodexOneShotTask` at `kimi-companion.mjs:686`. Legacy `handleTask`/`handleStatus`/`handleResult`/`handleCancel` behavior is unchanged when the flag is absent.
 
@@ -85,7 +89,7 @@ There is no Codex conversation id available to a shell tool, and KMP-34 is defer
 
 | Transition | Who may perform it | Authority effect | Notes |
 |---|---|---|---|
-| ∅ → `queued` | **Launch invocation only** (elevated `$kimi-task --codex-background`) | The *only* transition that may set `write: true`, `ttlDeadline`, `model`, `resumeSessionId`, `claimTokenHash` | Refused if another job is active (§4), if `KIMI_COMPANION_AGENT_SPAWN` is set, or if `--resume-session` is supplied without an exact id |
+| ∅ → `queued` | **Launch invocation only** (elevated `$kimi-task --codex-background`) | The *only* transition that may set `write`, `ttlDeadline`, `model`, `resumeSessionId`, `claimTokenHash` — and per §14 Q1 it may only ever seal `write: false` | Refused if another job is active (§4), if `KIMI_COMPANION_AGENT_SPAWN` is set, if `--write` is supplied (§14 Q1), or if `--resume-session` is supplied without an exact id |
 | `queued` → `running` | Detached worker (`task-worker`) | None. Worker **re-reads** the record and must fail loudly if `write` differs from the launch-recorded value | `runTrackedJob` in `tracked-jobs.mjs:142` already writes this |
 | `running` → `completed`/`failed` | Worker only | None | `runTrackedJob` completion semantics port as-is |
 | `running` → `cancelled` | **Worker only**, and only on `stopReason === "cancelled"` | None | This is the *confirmed* cancel path |
@@ -113,6 +117,8 @@ There is no way to make a detached worker re-request elevation. So the mitigatio
    - *Self-abort:* the worker arms an `AbortController` on the same path `runCodexOneShotTask` uses (`kimi-companion.mjs:687-691`), firing at `ttlDeadline`, producing the same `Cancellation unconfirmed:` discipline already in `runKimiTurn` (`lib/kimi.mjs:~740-770`).
    - *External enforcement:* the reconciler marks any record past `ttlDeadline` terminal (`failed`, reason "deadline exceeded; liveness unconfirmed") when **any** reader arrives. A wedged worker will not honor its own timer.
    - Default ceiling 30 minutes; `--ttl-minutes` may only *lower* it; hard max enforced in the runtime, not the skill.
+
+   > **Superseded by §14 Q2.** The ratified contract is a 30-minute **default** with a 60-minute **hard ceiling**: `--ttl-minutes` accepts 1–60, so it may raise above the default as well as lower it. The runtime enforcement and the two-enforcer design above are unchanged.
 
 2. **The consent text must state what is being granted.** `$kimi-task`'s background justification must say, in the `require_escalated` justification string: that the job continues after this call returns, the maximum duration, and — for write — that Kimi holds normal user filesystem write authority for that whole window without further prompts. This is pinnable by the surface test exactly like the existing `normal user filesystem authority` / `not an OS sandbox` assertions.
 
