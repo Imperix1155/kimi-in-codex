@@ -222,9 +222,22 @@ await withBroker("slow-prompt", async (session, cwd) => {
   assert.ok(busy, "expected busy while the dead client's turn still runs");
   assert.equal(busy.code, BROKER_BUSY_RPC_CODE);
 
-  // After the abandoned turn completes, ownership released cleanly.
-  await new Promise((resolve) => setTimeout(resolve, 600));
-  const after = await clientB.request("session/new", { cwd, mcpServers: [] });
+  // After the abandoned turn completes, ownership released cleanly. Waited
+  // for, not slept through: a fixed settle assumed the abandoned turn had
+  // finished, and a loaded runner reports the still-busy broker as a failure
+  // to release ownership.
+  let after = null;
+  const releaseDeadline = Date.now() + 15_000;
+  for (;;) {
+    try {
+      after = await clientB.request("session/new", { cwd, mcpServers: [] });
+      break;
+    } catch (error) {
+      assert.equal(error.code, BROKER_BUSY_RPC_CODE, `unexpected error while waiting for release: ${error.message}`);
+      assert.ok(Date.now() < releaseDeadline, "ownership was never released after the abandoned turn completed");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
   assert.ok(after.sessionId);
   await clientB.close();
 });
@@ -253,7 +266,7 @@ await withBroker("slow-prompt", async (session, cwd) => {
 
       const clientB = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
       let nextSession = null;
-      const deadline = Date.now() + 2000;
+      const deadline = Date.now() + 15_000;
       while (!nextSession && Date.now() < deadline) {
         try {
           nextSession = await clientB.request("session/new", { cwd, mcpServers: [] });
@@ -286,17 +299,28 @@ await withBroker("slow-prompt-3s", async (session, cwd) => {
   const clientA = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
   await clientA.request("session/new", { cwd, mcpServers: [] });
   const turn = clientA.request("session/prompt", { sessionId: "sess-1", prompt: [{ type: "text", text: "x" }] });
-  await new Promise((resolve) => setTimeout(resolve, 200));
 
   const clientB = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
-  // Proves the broker really is busy for ordinary methods on this socket.
+  // PRECONDITION, established from an INDEPENDENT oracle. A fixed sleep here
+  // assumed the prompt had reached the agent; on a loaded runner it has not,
+  // and the block then fails as though broker/status had misreported.
+  //
+  // The oracle is deliberately NOT broker/status: this block exists to prove
+  // broker/status sits BEFORE the busy gate, so establishing busy-ness with
+  // broker/status would let a regression that moves it behind the gate fail
+  // the precondition instead of the assertion. An ordinary method going
+  // BROKER_BUSY is independent evidence of the same fact.
   let busy = null;
-  try {
-    await clientB.request("session/new", { cwd, mcpServers: [] });
-  } catch (error) {
-    busy = error;
+  const busyDeadline = Date.now() + 15_000;
+  while (!busy && Date.now() < busyDeadline) {
+    try {
+      await clientB.request("session/new", { cwd, mcpServers: [] });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } catch (error) {
+      busy = error;
+    }
   }
-  assert.ok(busy, "expected a busy error for an ordinary method while the turn runs");
+  assert.ok(busy, "PRECONDITION — no turn ever went in flight, so the busy gate was never exercised");
   assert.equal(busy.code, BROKER_BUSY_RPC_CODE);
 
   const status = await clientB.request("broker/status", {});
@@ -335,7 +359,22 @@ await withBroker("slow-prompt-3s", async (session, cwd) => {
         sessionId: workerSession.sessionId,
         prompt: [{ type: "text", text: "detached background turn" }]
       }).catch(() => {});
-      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      // PRECONDITION: killing the socket only tests disconnect-cancellation if
+      // a turn is actually in flight when it dies. A fixed sleep assumed that;
+      // a loaded runner does not honour the assumption.
+      const inFlight = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      let flightSeen = false;
+      const flightDeadline = Date.now() + 15_000;
+      while (!flightSeen && Date.now() < flightDeadline) {
+        const probe = await inFlight.request("broker/status", {});
+        flightSeen = probe.activeSessions.includes(workerSession.sessionId);
+        if (!flightSeen) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      await inFlight.close();
+      assert.ok(flightSeen, "PRECONDITION — the worker's turn never went in flight before its socket was killed");
       worker.socket.destroy();
 
       const observer = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });

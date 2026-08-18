@@ -219,6 +219,79 @@ function upsertCodexJobIndex(jobId, patch, { env, cwd }) {
   assert.equal(probe.status, 0, `could not patch job index ${jobId}: ${probe.stderr}`);
 }
 
+// PRECONDITION HELPER. `process.kill` only DELIVERS a signal; the target is
+// still scheduled to die. Blocks that kill a worker and then act as if it were
+// gone were encoding that delay as a fixed sleep.
+async function awaitProcessGone(pid, label, timeoutMs = 30_000) {
+  if (!Number.isFinite(pid)) {
+    return;
+  }
+  const gone = await pollUntil(
+    () => {
+      try {
+        process.kill(pid, 0);
+        return null;
+      } catch (error) {
+        return error?.code === "EPERM" ? null : true;
+      }
+    },
+    timeoutMs,
+    50
+  );
+  assert.ok(gone, `${label}: PRECONDITION — worker ${pid} was still alive after being killed`);
+}
+
+// broker/status through the real runtime: the only thing that can establish
+// that a TURN IS IN FLIGHT.
+function readBrokerProbe({ env, cwd }) {
+  const script = `
+    (async () => {
+      const kimi = await import(process.argv[2]);
+      const probe = await kimi.probeBrokerStatus(process.argv[1], { timeoutMs: 2000 });
+      process.stdout.write(JSON.stringify(probe));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", script, cwd, pathToImport("../scripts/lib/kimi.mjs")],
+    { env, cwd, encoding: "utf8", timeout: 15_000 }
+  );
+  assert.equal(probe.status, 0, `could not probe broker status: ${probe.stderr}`);
+  return JSON.parse(probe.stdout);
+}
+
+// PRECONDITION HELPER for every block whose behaviour depends on a live turn.
+//
+// `status: "running"` is NOT that evidence. runTrackedJob writes it before it
+// opens a client, so it means only "the worker process started" — the broker
+// may not exist yet and the prompt may not have been sent. A block that
+// cancels on that signal can reach a runtime with no broker at all, where
+// "no shared Kimi runtime is active, so no turn can be in flight" is a
+// TRUTHFUL confirmed cancellation — and the block then fails as if the
+// runtime had mislabelled something. (PR #4 CI run 32133578789.)
+//
+// broker/status is the real oracle: the broker answers it locally, before the
+// busy gate, and names the sessions actually in flight.
+async function awaitTurnInFlight(jobId, context, label, timeoutMs = 30_000) {
+  assert.ok(
+    await pollCodexJobStatus(jobId, ["running"], context, timeoutMs),
+    `${label}: PRECONDITION — the job never reached running`
+  );
+  const probe = await pollUntil(
+    () => {
+      const seen = readBrokerProbe(context);
+      return seen.reachable && seen.activeSessions.length > 0 ? seen : null;
+    },
+    timeoutMs,
+    200
+  );
+  assert.ok(
+    probe,
+    `${label}: PRECONDITION — no turn was ever in flight (broker/status never named an active session), so this block cannot exercise what it claims: ${JSON.stringify(readBrokerProbe(context))}`
+  );
+  return probe;
+}
+
 // The broker STARTUP lock, read through the real resolver. A holder killed
 // mid-spawn leaves this behind, and until it goes stale every client that
 // wants a broker is walled out — so a test that is about to cold-start one
@@ -2034,7 +2107,7 @@ function listLeakedTestProcesses() {
   const launch = launchBackground(["a turn cancelled with the wrong token"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const jobId = launch.payload.jobId;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+  await awaitTurnInFlight(jobId, context, "a wrong claim token must not block a live cancel");
 
   const cancel = runCli(["cancel", "--codex-job", jobId, "--claim", "f".repeat(64), "--json"], context);
   assert.equal(cancel.status, 0, `a wrong claim token must not block cancel: ${cancel.stderr}`);
@@ -2420,16 +2493,15 @@ function listLeakedTestProcesses() {
   const launch = launchBackground(["a turn that outlives its deadline"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const jobId = launch.payload.jobId;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 30_000), "job never reached running");
   // `running` is NOT proof the broker exists: runTrackedJob writes it before
   // it opens a client, so a worker killed on that signal can still be inside
   // ensureBrokerSession HOLDING the broker startup lock — which it then never
-  // releases, walling out the requeued worker below. The agent's start marker
-  // is the real signal: it is written after the broker is up and the lock
-  // released. (This is what failed on PR #4 CI, run 32128776148.)
+  // releases, walling out the requeued worker below. (PR #4 CI 32128776148.)
+  // Both oracles: the agent's start marker, and a turn genuinely in flight.
+  await awaitTurnInFlight(jobId, context, "the first run must reach a live turn before it is killed");
   assert.ok(
     await pollUntil(() => (fs.existsSync(startMarker) ? true : null), 30_000, 100),
-    "the first run's agent never started, so the broker lock may still be held"
+    "PRECONDITION — the first run's agent never started, so the broker lock may still be held"
   );
 
   // Reclaim the sealed record, then stop the first run's worker and runtime.
@@ -2644,7 +2716,7 @@ function listLeakedTestProcesses() {
   const launch = launchBackground(["a turn that ignores cancellation"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const jobId = launch.payload.jobId;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+  await awaitTurnInFlight(jobId, context, "ignored-cancel must land on unknown");
 
   const cancel = runCli(["cancel", "--codex-job", jobId, "--json"], context);
   const payload = JSON.parse(cancel.stdout);
@@ -2668,7 +2740,7 @@ function listLeakedTestProcesses() {
   const launch = launchBackground(["a cancellable turn"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const jobId = launch.payload.jobId;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+  await awaitTurnInFlight(jobId, context, "confirmed cancel needs a live turn to cancel");
 
   const cancel = runCli(["cancel", "--codex-job", jobId, "--json"], context);
   assert.equal(cancel.status, 0, `confirmed cancel failed: ${cancel.stderr}`);
@@ -2696,7 +2768,7 @@ function listLeakedTestProcesses() {
   const launch = launchBackground(["a turn that settles under the cancel"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const { jobId, claimToken } = launch.payload;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+  await awaitTurnInFlight(jobId, context, "a job that settles under the cancel");
 
   const record = readCodexJobFile(jobId, context);
   const workerPid = record.pid;
@@ -2778,7 +2850,7 @@ function listLeakedTestProcesses() {
   const launch = launchBackground(["a turn that settles before the cancel"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const { jobId, claimToken } = launch.payload;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+  await awaitTurnInFlight(jobId, context, "a job that settled before the cancel");
 
   const record = readCodexJobFile(jobId, context);
   // The turn is over and its worker is gone, exactly as it would be a moment
@@ -2788,7 +2860,7 @@ function listLeakedTestProcesses() {
       process.kill(record.pid, "SIGKILL");
     } catch {}
   }
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  await awaitProcessGone(record.pid, "a job that settled before the cancel");
 
   // Worker write 1 of 2: the durable record is settled `completed`.
   writeCodexJobFileOnly(
@@ -2843,7 +2915,7 @@ function listLeakedTestProcesses() {
   const launch = launchBackground(["a turn nobody could show stopped"], context);
   assert.equal(launch.status, 0, launch.stderr);
   const jobId = launch.payload.jobId;
-  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+  await awaitTurnInFlight(jobId, context, "repeat cancel of an unknown job");
 
   const record = readCodexJobFile(jobId, context);
   const workerPid = record.pid;
@@ -2943,7 +3015,10 @@ function listLeakedTestProcesses() {
 
 // Final leak sweep: the suite itself fails if any scenario left a broker or
 // fake agent running — silent leaks must not depend on a manual pgrep.
-await new Promise((resolve) => setTimeout(resolve, 500));
+// Give the OS time to reap what the suite already terminated — a process in
+// the middle of dying is not a leak, and a fixed settle made that a coin flip
+// on a slow runner. The assertion itself is unchanged: still exactly zero.
+await pollUntil(() => (listLeakedTestProcesses().length === 0 ? true : null), 15_000, 250);
 const leaked = listLeakedTestProcesses();
 assert.deepEqual(leaked, [], `leaked TEST processes:\n${leaked.join("\n")}`);
 
