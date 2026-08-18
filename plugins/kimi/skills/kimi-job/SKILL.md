@@ -67,16 +67,27 @@ Launching a job is a different authority class and belongs to `$kimi-task`.
    - `result` requires the claim token and refuses without it. A job that is
      still `queued`, `running`, or `cancel-requested` has no result yet.
    - `cancel` needs no token, because a job with no reachable off switch is the
-     worse failure. Report its `cancelStatus` exactly:
+     worse failure. A token is not merely optional here: if one is supplied it
+     is **ignored outright**, never validated — so a wrong or stale token can
+     neither block the cancellation nor reveal that it was wrong. Do not ask
+     the user for a token in order to cancel. Report its `cancelStatus`
+     exactly:
      - `CANCELLED` means the stop was **confirmed** — the worker recorded a
        cancelled stop reason, or the runtime showed the session gone.
      - `UNKNOWN` means the stop was requested and signalled but
        **could not be confirmed**. Say so, and pass on the `residualRisk`
        text verbatim.
        Never restate `UNKNOWN` as cancelled, stopped, or killed.
+     - `NOT ACTIVE` means the job had already reached a terminal state on its
+       own; nothing was stopped and its recorded result is intact. Report the
+       state it gives you, never as a cancellation.
    - A job may also read `failed` with "liveness cannot be confirmed" or
      "deadline exceeded". That wording is deliberate: it reports what was
      established, not that the worker died.
+   - A **refusal** on any of the three commands (malformed job id, `result`
+     without a token, `result` on a job still running) is also JSON:
+     `{"jobStatus": "REFUSED", "error": "..."}` with a nonzero exit. Report the
+     `error` text; do not retry, and do not guess at the job's state.
 
 ## Scope and safety
 

@@ -65,7 +65,10 @@ for (const document of [readme, agents, buildPlan]) {
   // claim: background exists but is read-only, one-at-a-time, and TTL-bounded.
   assert.match(document, /background.*read-only|read-only.*background/i);
   assert.match(document, /one (?:background )?job at a time|one at a time/i);
-  assert.match(document, /TTL|30[- ]minute|deadline/i);
+  // Pin the NUMBERS, not the word "deadline": the bare alternative was
+  // satisfied by unrelated lifecycle prose, so the pin passed even with the
+  // TTL disclosure deleted.
+  assert.match(document, /30[- ]minute default|60[- ]minute (?:hard )?ceiling/i);
   assert.match(document, /exact job ID|exact-id/i);
   assert.match(document, /claim token/i);
   // Write-enabled background remains deferred, and rescue still is too.
