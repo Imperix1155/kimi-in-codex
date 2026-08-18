@@ -78,7 +78,7 @@ rl.on("line", (line) => {
       if (process.env.KIMI_FAKE_CANCEL_MARKER) {
         fs.writeFileSync(process.env.KIMI_FAKE_CANCEL_MARKER, "cancelled\n", "utf8");
       }
-      // KMP-32: these two deliberately IGNORE the cancel. They are the
+      // KMP-32: these three deliberately IGNORE the cancel. They are the
       // fixtures that exercise the false-CANCELLED path — the runtime must
       // land on `unknown`, never on a terminal `cancelled`.
       if (

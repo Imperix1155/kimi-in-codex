@@ -2,6 +2,13 @@
 // against the scripted fake agent (KIMI_COMPANION_AGENT_SPAWN override),
 // with job state isolated via CLAUDE_PLUGIN_DATA.
 // Run: node plugin/tests/kimi-companion.test.mjs  (prints KIMI-COMPANION-TESTS-GREEN)
+//
+// PLATFORM SCOPE: this suite is POSIX-only by design, and deliberately not
+// platform-neutral. The KMP-32 background cases need real `kimi` discovery on
+// PATH (the agent-spawn seam is refused by the background launch), so they
+// write a `#!/bin/sh` shim, join PATH with `:`, and read process liveness with
+// `ps`. The runtime itself still supports win32; only this harness does not.
+// CI runs it on ubuntu-latest.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -82,8 +89,14 @@ function makeBackgroundWorkspace(scenario, fakeEnv = {}) {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-bg-"));
   const pluginData = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-data-"));
   const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-shim-"));
+  // JSON quoting is not SHELL quoting: JSON.stringify emits a double-quoted
+  // string, and /bin/sh expands $, backticks and backslashes inside those. A
+  // fakeEnv value carrying any of them would reach the fixture altered or
+  // break the shim outright. Today's callers pass temp paths, so this is
+  // latent rather than live — single-quote escaping keeps it that way.
+  const shQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
   const exports = Object.entries(fakeEnv)
-    .map(([key, value]) => `export ${key}=${JSON.stringify(String(value))}`)
+    .map(([key, value]) => `export ${key}=${shQuote(value)}`)
     .join("\n");
   fs.writeFileSync(
     path.join(shimDir, "kimi"),

@@ -67,8 +67,11 @@ for (const document of [readme, agents, buildPlan]) {
   assert.match(document, /one (?:background )?job at a time|one at a time/i);
   // Pin the NUMBERS, not the word "deadline": the bare alternative was
   // satisfied by unrelated lifecycle prose, so the pin passed even with the
-  // TTL disclosure deleted.
-  assert.match(document, /30[- ]minute default|60[- ]minute (?:hard )?ceiling/i);
+  // TTL disclosure deleted. One assertion PER NUMBER, because an alternation
+  // is satisfied by whichever number survives — deleting the default
+  // disclosure and keeping the ceiling would have left this green.
+  assert.match(document, /30[- ]minutes? (?:by )?default/i);
+  assert.match(document, /60[- ]minutes? (?:hard )?ceiling/i);
   assert.match(document, /exact job ID|exact-id/i);
   assert.match(document, /claim token/i);
   // Write-enabled background remains deferred, and rescue still is too.
