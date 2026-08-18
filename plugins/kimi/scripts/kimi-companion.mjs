@@ -1085,26 +1085,51 @@ function patchCodexJobIfUnsettled(workspaceRoot, jobId, patch) {
   );
 }
 
+// The pre-write view patchJobUnderLock hands back, merged the same way
+// resolveCodexBackgroundJob merges: the index carries the freshest status, the
+// durable record carries everything else.
+function mergeJobViews({ stored, indexed }) {
+  return { ...(stored ?? {}), ...(indexed ?? {}) };
+}
+
 // A cancel that finds the job already settled reports that state as-is. It
 // never invents a verdict: "the session is gone" is evidence of COMPLETION
 // here, not of cancellation.
-function outputSettledCancel(jobId, status, { signalled }) {
+//
+// `unknown` is the exception, and it is Invariant C again on the REPEAT
+// cancel. It is not a finished state — it is the runtime's word for "the turn
+// could not be shown stopped, and Kimi may still be running". Answering
+// NOT ACTIVE / residualRisk: null there would be an operation whose purpose is
+// to stop work reporting the work inactive on no evidence, contradicting the
+// record's own errorMessage. It keeps the residual risk and the nonzero exit
+// the first unconfirmed cancel used, and it is never PROMOTED: nothing here
+// observed the turn stop.
+function outputSettledCancel(jobId, status, { signalled, job = null }) {
   const cancelled = status === "cancelled";
+  const unknown = status === "unknown";
+  const residualRisk = unknown
+    ? (job?.errorMessage ?? buildResidualRiskMessage(job?.write === true))
+    : null;
   outputResult(
     {
-      cancelStatus: cancelled ? "CANCELLED" : "NOT ACTIVE",
+      cancelStatus: cancelled ? "CANCELLED" : unknown ? "UNKNOWN" : "NOT ACTIVE",
       jobId,
       status,
       confirmed: cancelled,
       detail: cancelled
         ? "Cancellation confirmed: the worker recorded a cancelled stop reason."
-        : signalled
-          ? `Job ${jobId} reached ${status} on its own before the cancellation took effect; its recorded result was left intact.`
-          : `Job ${jobId} is already ${status}; nothing was signalled.`,
-      residualRisk: null
+        : unknown
+          ? `Job ${jobId} was already left \`unknown\`: an earlier cancellation could not be confirmed, and nothing here observed the turn stop.`
+          : signalled
+            ? `Job ${jobId} reached ${status} on its own before the cancellation took effect; its recorded result was left intact.`
+            : `Job ${jobId} is already ${status}; nothing was signalled.`,
+      residualRisk
     },
     true
   );
+  if (unknown) {
+    process.exitCode = 1;
+  }
 }
 
 // Invariant C, the single most important rule in this phase: no invocation
@@ -1131,7 +1156,7 @@ async function runCodexJobCancel(options) {
   // durable record already says `completed`.
   const alreadySettled = settledCodexJobStatus(stored, indexed);
   if (alreadySettled) {
-    outputSettledCancel(jobId, alreadySettled, { signalled: false });
+    outputSettledCancel(jobId, alreadySettled, { signalled: false, job });
     return;
   }
 
@@ -1145,7 +1170,10 @@ async function runCodexJobCancel(options) {
     cancelRequestedAt
   });
   if (!requested.applied) {
-    outputSettledCancel(jobId, settledCodexJobStatus(requested.stored, requested.indexed), { signalled: false });
+    outputSettledCancel(jobId, settledCodexJobStatus(requested.stored, requested.indexed), {
+      signalled: false,
+      job: mergeJobViews(requested)
+    });
     return;
   }
   appendLogLine(job.logFile, `Cancellation requested for session ${sessionId ?? "(none recorded)"}.`);
@@ -1212,7 +1240,7 @@ async function runCodexJobCancel(options) {
       outputSettledCancel(
         jobId,
         settledCodexJobStatus(confirmedWrite.stored, confirmedWrite.indexed),
-        { signalled: true }
+        { signalled: true, job: mergeJobViews(confirmedWrite) }
       );
       return;
     }
@@ -1242,7 +1270,10 @@ async function runCodexJobCancel(options) {
   if (!unknownWrite.applied) {
     // Nothing is unconfirmed: the job settled on its own. Exit 0 — the
     // nonzero exit below means "this cancel could not be shown to work".
-    outputSettledCancel(jobId, settledCodexJobStatus(unknownWrite.stored, unknownWrite.indexed), { signalled: true });
+    outputSettledCancel(jobId, settledCodexJobStatus(unknownWrite.stored, unknownWrite.indexed), {
+      signalled: true,
+      job: mergeJobViews(unknownWrite)
+    });
     return;
   }
   appendLogLine(job.logFile, `Cancellation unconfirmed: ${probeDetail}.`);

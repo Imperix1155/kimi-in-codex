@@ -2557,6 +2557,63 @@ function listLeakedTestProcesses() {
   shutdownBroker(context.env, context.cwd);
 }
 
+// Invariant C on the REPEAT cancel. `unknown` is not "finished" — it is the
+// runtime's word for "we could not show the turn stopped, and Kimi may still
+// be running". A second cancel finds it non-active and used to answer
+// `NOT ACTIVE` with `residualRisk: null` and exit 0 — an operation whose whole
+// purpose is to stop work reporting the work inactive with no evidence, and
+// contradicting the record's own errorMessage.
+{
+  const context = makeBackgroundWorkspace("cancel-ignored");
+  const launch = launchBackground(["a turn nobody could show stopped"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+
+  const record = readCodexJobFile(jobId, context);
+  const workerPid = record.pid;
+
+  // The first cancel could not be confirmed, exactly as the runtime records it.
+  const firstUnknown = runCli(["cancel", "--codex-job", jobId, "--json"], context);
+  const firstPayload = JSON.parse(firstUnknown.stdout);
+  assert.equal(firstPayload.cancelStatus, "UNKNOWN", firstUnknown.stdout);
+  assert.equal(firstUnknown.status, 1, "an unconfirmed cancel exits nonzero");
+
+  // The repeat cancel must tell the same truth, not a softer one.
+  const repeat = runCli(["cancel", "--codex-job", jobId, "--json"], context);
+  const payload = JSON.parse(repeat.stdout);
+  assert.equal(payload.status, "unknown", repeat.stdout);
+  assert.notEqual(
+    payload.cancelStatus,
+    "NOT ACTIVE",
+    `a job that could not be shown stopped must not be reported inactive: ${repeat.stdout}`
+  );
+  assert.equal(payload.cancelStatus, "UNKNOWN", repeat.stdout);
+  assert.equal(payload.confirmed, false, "nothing was confirmed the first time and nothing is confirmed now");
+  assert.ok(payload.residualRisk, `the residual risk must survive the repeat cancel: ${repeat.stdout}`);
+  assert.match(payload.residualRisk, /may still be running/i);
+  assert.equal(repeat.status, 1, "a repeat cancel of an unconfirmed job must not exit 0");
+
+  // A genuinely finished job is still reported as-is, with no invented risk.
+  writeCodexJobFile(
+    jobId,
+    { ...record, status: "completed", phase: "done", pid: null, errorMessage: null, result: { status: 0 } },
+    context
+  );
+  const settledRepeat = runCli(["cancel", "--codex-job", jobId, "--json"], context);
+  const settledPayload = JSON.parse(settledRepeat.stdout);
+  assert.equal(settledPayload.cancelStatus, "NOT ACTIVE", settledRepeat.stdout);
+  assert.equal(settledPayload.residualRisk, null, "a completed job carries no cancellation residual risk");
+  assert.equal(settledRepeat.status, 0, "reporting a finished job is not a failure");
+
+  if (Number.isFinite(workerPid)) {
+    try {
+      process.kill(workerPid, "SIGKILL");
+    } catch {}
+  }
+  shutdownBroker(context.env, context.cwd);
+}
+
 // §12 #5, third selector. task-resume-candidate and --resume-last scan the
 // workspace's job history, and their session filter fails OPEN when no
 // KIMI_COMPANION_SESSION_ID is exported — which is always the Codex case. A
