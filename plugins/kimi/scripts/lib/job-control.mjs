@@ -90,17 +90,46 @@ function markCodexJobTerminal(workspaceRoot, job, status, errorMessage) {
 // fired ends the turn as a graceful ACP cancel, which runTrackedJob records
 // as `cancelled` — indistinguishable from a user cancellation. The contract
 // says expiry is reported `failed`/deadline-exceeded, and the label must not
-// depend on which enforcer (self-abort vs reconciler) won the race. Only a
-// `cancelled` record is rewritten: a job that beat the timer to `completed`
-// keeps its result (the same never-destroy-a-settled-result rule cancel
-// follows).
+// depend on which enforcer (self-abort vs reconciler) won the race. A job
+// that beat the timer to `completed` keeps its result (the same
+// never-destroy-a-settled-result rule cancel follows).
+//
+// Called ONLY under the worker's own ttlExpired flag, which is set nowhere
+// but inside the deadline timer's callback.
 export function attributeTtlExpiry(workspaceRoot, jobId) {
   const stored = readStoredJob(workspaceRoot, jobId);
-  if (!stored || !stored.codexBackground || stored.status !== "cancelled") {
+  if (!stored || !stored.codexBackground) {
+    return false;
+  }
+  // C1 (driver ruling, 2026-08-17): a record carrying cancelRequestedAt had a
+  // USER cancellation in play, and the user's label wins — TTL attribution is
+  // for jobs nobody asked to stop. Read from both sources: runTrackedJob's
+  // completion write rebuilds the record from a snapshot taken at job start,
+  // dropping cancelRequestedAt from the durable file, while its index write
+  // is a merge patch that keeps it.
+  const indexed = listJobs(workspaceRoot).find((job) => job.id === jobId) ?? null;
+  if (stored.cancelRequestedAt || indexed?.cancelRequestedAt) {
+    return false;
+  }
+  if (!isTtlAttributableStatus(stored)) {
     return false;
   }
   markCodexJobTerminal(workspaceRoot, stored, "failed", TTL_SELF_ABORT_MESSAGE);
   return true;
+}
+
+function isTtlAttributableStatus(stored) {
+  // The agent honored the abort: a graceful cancel with no user behind it.
+  if (stored.status === "cancelled") {
+    return true;
+  }
+  // The WEDGED agent — the case the deadline exists for. It never
+  // acknowledges the abort, so runKimiTurn throws "Cancellation unconfirmed:
+  // ..." instead of returning a cancelled stop reason, and the job lands
+  // `failed` naming a cancellation nobody requested and never naming the
+  // deadline. Neither enforcer would otherwise attribute it: the reader-side
+  // reconciler early-returns on a terminal status.
+  return stored.status === "failed" && /^Cancellation unconfirmed:/.test(stored.errorMessage ?? "");
 }
 
 // The reconciler is the EXTERNAL enforcer: a wedged worker will not honor

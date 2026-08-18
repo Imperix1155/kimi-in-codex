@@ -202,6 +202,27 @@ function upsertCodexJobIndex(jobId, patch, { env, cwd }) {
   assert.equal(probe.status, 0, `could not patch job index ${jobId}: ${probe.stderr}`);
 }
 
+// Re-seals a mutated record with the REAL computeAuthoritySeal, so a test
+// that legitimately needs to change a sealed field (e.g. to bring a TTL
+// deadline within test time) stays subject to the seal rather than
+// hard-coding a hash the implementation could drift away from.
+function resealCodexJobRecord(record, { env, cwd }) {
+  const script = `
+    (async () => {
+      const codex = await import(process.argv[1]);
+      const record = JSON.parse(process.argv[2]);
+      process.stdout.write(JSON.stringify({ ...record, authoritySeal: codex.computeAuthoritySeal(record) }));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    ["-e", script, pathToImport("../scripts/lib/codex-jobs.mjs"), JSON.stringify(record)],
+    { env, cwd, encoding: "utf8", timeout: 10_000 }
+  );
+  assert.equal(probe.status, 0, `could not reseal record: ${probe.stderr}`);
+  return JSON.parse(probe.stdout);
+}
+
 async function pollCodexJobStatus(jobId, wanted, context, timeoutMs = 25_000) {
   return pollUntil(() => {
     const snapshot = codexStatus(jobId, context);
@@ -1920,6 +1941,71 @@ function listLeakedTestProcesses() {
   assert.equal(outcome.completed.errorMessage ?? null, null);
   assert.equal(outcome.keptLegacy, false, "legacy records are outside the Codex TTL contract");
   assert.equal(outcome.legacy.status, "cancelled");
+}
+
+// F6/F2: the TTL attribution WIRING, end to end through handleTaskWorker —
+// the pure-function probe above cannot see the call site being deleted, and
+// the branch is otherwise unreachable in the suite (a 30-minute default timer
+// never fires). The deadline is brought inside test time by re-sealing the
+// record, so the worker's own authority check still has to pass.
+//
+// The agent here IGNORES session/cancel — the wedged worker TTL exists to
+// bound. That path does not end the turn as a graceful cancel: runKimiTurn
+// THROWS "Cancellation unconfirmed: ...", which runTrackedJob records as
+// `failed` with a cancellation message the user never requested. The deadline
+// must still be what the record names.
+{
+  const context = makeBackgroundWorkspace("cancel-ignored");
+  const launch = launchBackground(["a turn that outlives its deadline"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+
+  // Reclaim the sealed record, then stop the first run's worker and runtime.
+  const record = readCodexJobFile(jobId, context);
+  if (Number.isFinite(record.pid)) {
+    try {
+      process.kill(record.pid, "SIGKILL");
+    } catch {}
+  }
+  shutdownBroker(context.env, context.cwd);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  // A deadline that falls DURING the turn, not before it: an already-past
+  // deadline fires the timer at 0ms and aborts before the prompt starts,
+  // which is a different sub-path from the wedged-agent one under test.
+  const requeued = resealCodexJobRecord(
+    {
+      ...record,
+      status: "queued",
+      phase: "queued",
+      pid: null,
+      completedAt: null,
+      errorMessage: null,
+      result: null,
+      rendered: null,
+      ttlDeadline: new Date(Date.now() + 1500).toISOString()
+    },
+    context
+  );
+  writeCodexJobFile(jobId, requeued, context);
+
+  const worker = runCli(["task-worker", "--job-id", jobId, "--cwd", context.cwd], context);
+  assert.notEqual(worker.status, 0, "a turn killed by its deadline is not a success");
+
+  const settled = readCodexJobFile(jobId, context);
+  assert.equal(settled.status, "failed", "an expired job is `failed`, never `cancelled`");
+  // Wording UNIQUE to TTL_SELF_ABORT_MESSAGE. DEADLINE_EXCEEDED_MESSAGE also
+  // opens with "Deadline exceeded", so matching that alone would stay green
+  // with the attribution call site deleted.
+  assert.match(settled.errorMessage, /time budget/i, "the record must name the deadline as the cause");
+  assert.match(settled.errorMessage, /did not fail on its own/i);
+  assert.doesNotMatch(
+    settled.errorMessage,
+    /^Cancellation unconfirmed:/,
+    "an expired job must not report a cancellation nobody requested"
+  );
+  shutdownBroker(context.env, context.cwd);
 }
 
 // §12 #12/#13 at the runtime level. Cancelling a job whose agent IGNORES
