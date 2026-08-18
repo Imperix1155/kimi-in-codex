@@ -1203,7 +1203,11 @@ async function runCodexJobCancel(options) {
       confirmedBy = "the worker recorded a cancelled stop reason";
       break;
     }
-    const probe = await probeBrokerStatus(cwd);
+    // The probe gets only the window that is actually left, so a stalled
+    // broker cannot outlast the confirmation deadline it is evidence for.
+    const probe = await probeBrokerStatus(cwd, {
+      timeoutMs: Math.max(CANCEL_CONFIRM_POLL_MS, deadline - Date.now())
+    });
     probeDetail = probe.detail;
     if (!probe.running) {
       confirmedBy = "no shared Kimi runtime is active, so no turn can be in flight";

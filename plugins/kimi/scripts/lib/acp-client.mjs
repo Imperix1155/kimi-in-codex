@@ -364,6 +364,11 @@ class SpawnedAcpClient extends AcpClientBase {
   }
 }
 
+// How long a graceful socket close may take before we stop waiting on the
+// peer and destroy our end. Socket teardown against a live peer is
+// sub-millisecond; this only bounds a wedged one.
+const BROKER_CLOSE_GRACE_MS = 250;
+
 class BrokerAcpClient extends AcpClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
@@ -431,6 +436,20 @@ class BrokerAcpClient extends AcpClientBase {
     this.closed = true;
     if (this.socket) {
       this.socket.end();
+      // `end()` only sends OUR half. A wedged peer never closes its own, and
+      // exitPromise resolves on the socket's `close` event — so awaiting it
+      // hung the caller forever. That is fatal for the cancellation probe,
+      // whose entire value is being bounded. A healthy peer closes in
+      // microseconds; past the grace we destroy the socket, which fires
+      // `close` and resolves exitPromise.
+      const grace = setTimeout(() => this.socket?.destroy(), BROKER_CLOSE_GRACE_MS);
+      grace.unref?.();
+      try {
+        await this.exitPromise;
+      } finally {
+        clearTimeout(grace);
+      }
+      return;
     }
     await this.exitPromise;
   }

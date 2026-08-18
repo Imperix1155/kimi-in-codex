@@ -126,17 +126,25 @@ function resolveBrokerStateFile(cwd) {
   return path.join(resolveStateDir(cwd), BROKER_STATE_FILE);
 }
 
-export function loadBrokerSession(cwd) {
+// KMP-32: ABSENT and UNREADABLE are different facts, and a caller that treats
+// "no endpoint" as proof that no runtime is up must not conflate them. A
+// missing record means none was ever written; a present-but-unparseable one
+// means we know nothing — the broker may be alive with a turn in flight.
+export function readBrokerSessionState(cwd) {
   const stateFile = resolveBrokerStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
-    return null;
+    return { present: false, session: null };
   }
 
   try {
-    return JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    return { present: true, session: JSON.parse(fs.readFileSync(stateFile, "utf8")) };
   } catch {
-    return null;
+    return { present: true, session: null };
   }
+}
+
+export function loadBrokerSession(cwd) {
+  return readBrokerSessionState(cwd).session;
 }
 
 export function saveBrokerSession(cwd, session) {

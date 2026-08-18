@@ -229,4 +229,109 @@ function connectTo(scenario, options = {}) {
   await client.close();
 }
 
+// 11. KMP-32: probeBrokerStatus is the CONFIRMATION half of cancellation, so
+// every answer it gives is evidence someone will act on. Two contracts.
+//
+// (a) A missing broker record and an UNREADABLE one are different facts.
+// loadBrokerSession returns null for both, and reporting `running: false` for
+// the unreadable case would let a cancel claim a confirmed stop against a
+// broker that may still be mid-turn.
+//
+// (b) Neither the connect nor the request was bounded, so a broker that
+// accepts the socket and then stops answering hung the probe indefinitely —
+// bypassing the caller's confirmation window, which cannot inspect its own
+// deadline while a probe is pending.
+{
+  const fs = await import("node:fs");
+  const net = await import("node:net");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { probeBrokerStatus } = await import("../scripts/lib/kimi.mjs");
+  const { saveBrokerSession } = await import("../scripts/lib/broker-lifecycle.mjs");
+  const { resolveStateDir } = await import("../scripts/lib/state.mjs");
+
+  const previousData = process.env.KIMI_COMPANION_DATA;
+  process.env.KIMI_COMPANION_DATA = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-probe-data-"));
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-probe-"));
+
+  // (a1) No record at all: nothing was ever started, so nothing can be running.
+  const absent = await probeBrokerStatus(cwd);
+  assert.equal(absent.running, false, "a missing broker record means no runtime is up");
+  assert.equal(absent.reachable, false);
+
+  // (a2) A record that exists but cannot be parsed establishes NOTHING.
+  const brokerStateFile = path.join(resolveStateDir(cwd), "broker.json");
+  fs.mkdirSync(path.dirname(brokerStateFile), { recursive: true });
+  fs.writeFileSync(brokerStateFile, "{ this is not json", "utf8");
+  const malformed = await probeBrokerStatus(cwd);
+  assert.equal(
+    malformed.running,
+    true,
+    "an unreadable broker record must never be reported as proof that no turn is in flight"
+  );
+  assert.equal(malformed.reachable, false);
+  assert.match(malformed.detail, /unreadable/i);
+
+  // (b) Two stalls, one per unbounded leg. `answerInitialize: false` wedges
+  // the handshake; `true` lets the handshake through and then never answers
+  // broker/status — the realistic shape, since the broker answers both
+  // methods locally and a wedged event loop answers neither.
+  async function probeAgainstDeafBroker({ answerInitialize }) {
+    const socketDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-probe-sock-"));
+    const socketPath = path.join(socketDir, "broker.sock");
+    const connections = [];
+    const deaf = net.createServer((socket) => {
+      connections.push(socket);
+      socket.setEncoding("utf8");
+      socket.on("error", () => {});
+      socket.on("data", (chunk) => {
+        if (!answerInitialize) {
+          return;
+        }
+        for (const line of chunk.split("\n").filter(Boolean)) {
+          const message = JSON.parse(line);
+          if (message.method === "initialize") {
+            socket.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                id: message.id,
+                result: { protocolVersion: 1, agentInfo: { name: "Kimi Code CLI", version: "1.49.0" } }
+              })}\n`
+            );
+          }
+          // Every other method — broker/status included — goes unanswered.
+        }
+      });
+    });
+    await new Promise((resolve) => deaf.listen(socketPath, resolve));
+    saveBrokerSession(cwd, { endpoint: `unix:${socketPath}` });
+
+    const startedAt = Date.now();
+    const outcome = await probeBrokerStatus(cwd, { timeoutMs: 700 });
+    const elapsed = Date.now() - startedAt;
+
+    for (const socket of connections) {
+      socket.destroy();
+    }
+    await new Promise((resolve) => deaf.close(resolve));
+    fs.rmSync(socketDir, { recursive: true, force: true });
+    return { outcome, elapsed };
+  }
+
+  for (const answerInitialize of [false, true]) {
+    const { outcome, elapsed } = await probeAgainstDeafBroker({ answerInitialize });
+    const leg = answerInitialize ? "broker/status" : "handshake";
+    assert.ok(elapsed < 5000, `a stalled ${leg} must return on the probe's own budget, took ${elapsed}ms`);
+    assert.equal(outcome.reachable, false, `${leg}: a probe that never answered reached nothing`);
+    assert.equal(outcome.running, true, `${leg}: an unanswered probe can never count as confirmation`);
+    assert.deepEqual(outcome.activeSessions, []);
+  }
+
+  if (previousData === undefined) {
+    delete process.env.KIMI_COMPANION_DATA;
+  } else {
+    process.env.KIMI_COMPANION_DATA = previousData;
+  }
+}
+
 console.log("KIMI-TESTS-GREEN");
