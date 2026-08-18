@@ -511,7 +511,13 @@ export class AcpClient {
           brokerEndpoint = brokerSession?.endpoint ?? null;
           brokerWasReused = Boolean(brokerSession?.reused);
           if (!brokerEndpoint) {
-            throw new AcpError("Failed to start the shared agent broker.");
+            // ensureBrokerSession returns null for exactly one reason: it
+            // never acquired the broker startup lock, so it never attempted a
+            // start. Saying "failed to start" here names a cause that was
+            // never established — and sends the reader hunting a spawn bug.
+            throw new AcpError(
+              "Could not acquire the shared agent broker's startup lock; another process is holding it and no running broker was available to reuse. Nothing was started — retry the command."
+            );
           }
         }
       }

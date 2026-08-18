@@ -865,5 +865,47 @@ for (const spawnCase of [
   }
 }
 
+// 16. A broker.lock orphaned by a killed holder must not become a wall.
+//
+// The lock is stolen once it goes BROKER_LOCK_STALE_MS untouched, but
+// ensureBrokerSession used to give up after ~5s — ten seconds before its own
+// recovery could fire. So any client arriving while an orphaned lock was
+// fresh was GUARANTEED to fail, and to fail as "Failed to start the shared
+// agent broker": a start it never attempted, with none of the startup
+// diagnostics KMP-32 added, because the lock was never acquired.
+//
+// Observed on PR #4 CI: the deadline-path test SIGKILLs a worker as soon as
+// its record says `running`, and runTrackedJob writes `running` BEFORE the
+// runner opens a client — so the kill can land while the worker holds this
+// lock, and the next worker inherits the wall.
+{
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-lockwall-"));
+  const { BROKER_LOCK_STALE_MS } = await import("../scripts/lib/broker-lifecycle.mjs");
+  const { resolveStateDir } = await import("../scripts/lib/state.mjs");
+
+  // A lock left behind by a holder that was killed mid-spawn: it exists, its
+  // mtime is fresh, and nobody will ever release it.
+  const lockDir = path.join(resolveStateDir(cwd), "broker.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+
+  const startedAt = Date.now();
+  const session = await ensureBrokerSession(cwd, { extraBrokerArgs: agentSpawnArgs("basic") });
+  const waited = Date.now() - startedAt;
+
+  assert.ok(session?.endpoint, "an orphaned lock must be stolen, not treated as a permanent wall");
+  assert.ok(
+    waited >= BROKER_LOCK_STALE_MS,
+    `the steal cannot fire before the lock is stale (waited ${waited}ms)`
+  );
+  // The load-bearing assertion: the caller must outlast its own recovery
+  // window. Giving up first is what made the failure guaranteed.
+  assert.ok(
+    waited < BROKER_LOCK_STALE_MS + 10_000,
+    `the wait must end shortly after the steal, not drag on (waited ${waited}ms)`
+  );
+  await sendBrokerShutdown(session.endpoint).catch(() => {});
+  await waitForEndpointDeath(session.endpoint);
+}
+
 console.log("ACP-BROKER-TESTS-GREEN");
 process.exit(0);
