@@ -33,6 +33,7 @@ let nextAgentRequestId = 1000;
 let sessionCount = 0;
 let promptCount = 0;
 let heldPromptId = null;
+let heldPromptTimer = null;
 const waiters = new Map();
 const observed = {};
 
@@ -67,7 +68,17 @@ rl.on("line", (line) => {
   // cancel arriving BEFORE the prompt is remembered and applied to the next
   // prompt immediately (mirrors real agents: no interleaving hangs forever).
   if (message.id === undefined && message.method === "session/cancel") {
-    if (scenario === "cancellable") {
+    if (scenario === "cancellable" || scenario === "cancel-write-delay" || scenario === "cancel-unconfirmed") {
+      if (process.env.KIMI_FAKE_CANCEL_MARKER) {
+        fs.writeFileSync(process.env.KIMI_FAKE_CANCEL_MARKER, "cancelled\n", "utf8");
+      }
+      if (scenario === "cancel-unconfirmed") {
+        return;
+      }
+      if (heldPromptTimer) {
+        clearTimeout(heldPromptTimer);
+        heldPromptTimer = null;
+      }
       if (heldPromptId !== null) {
         const promptId = heldPromptId;
         heldPromptId = null;
@@ -103,6 +114,12 @@ rl.on("line", (line) => {
 
   if (message.method === "session/load") {
     observed.wasLoaded = true;
+    if (scenario === "hang-session-load") {
+      if (process.env.KIMI_SESSION_LOAD_MARKER) {
+        fs.writeFileSync(process.env.KIMI_SESSION_LOAD_MARKER, `${message.params?.sessionId ?? ""}\n`, "utf8");
+      }
+      return;
+    }
     send({ id: message.id, result: {} });
     return;
   }
@@ -383,6 +400,37 @@ rl.on("line", (line) => {
         observed.pendingCancel = false;
         send({ id: message.id, result: { stopReason: "cancelled" } });
         return;
+      }
+      heldPromptId = message.id;
+      return;
+    }
+
+    if (scenario === "cancel-write-delay") {
+      if (process.env.KIMI_FAKE_PROMPT_MARKER) {
+        fs.writeFileSync(process.env.KIMI_FAKE_PROMPT_MARKER, "prompt-active\n", "utf8");
+      }
+      if (observed.pendingCancel) {
+        observed.pendingCancel = false;
+        send({ id: message.id, result: { stopReason: "cancelled" } });
+        return;
+      }
+      heldPromptId = message.id;
+      heldPromptTimer = setTimeout(() => {
+        const promptId = heldPromptId;
+        heldPromptId = null;
+        heldPromptTimer = null;
+        if (process.env.KIMI_FAKE_POST_CANCEL_MARKER) {
+          fs.writeFileSync(process.env.KIMI_FAKE_POST_CANCEL_MARKER, "write-completed\n", "utf8");
+        }
+        send({ method: "session/update", params: { sessionId: message.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "delayed write completed" } } } });
+        send({ id: promptId, result: { stopReason: "end_turn" } });
+      }, Number(process.env.KIMI_FAKE_CANCEL_WRITE_DELAY_MS) || 750);
+      return;
+    }
+
+    if (scenario === "cancel-unconfirmed") {
+      if (process.env.KIMI_FAKE_PROMPT_MARKER) {
+        fs.writeFileSync(process.env.KIMI_FAKE_PROMPT_MARKER, "prompt-active\n", "utf8");
       }
       heldPromptId = message.id;
       return;

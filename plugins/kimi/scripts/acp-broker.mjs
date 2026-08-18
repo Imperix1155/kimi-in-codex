@@ -79,10 +79,13 @@ async function main() {
   let activeCount = 0;
   let shuttingDown = false;
   const sockets = new Set();
+  const disconnectedSockets = new WeakSet();
   // sessionId -> creating socket. A session's permission policy may only be
   // changed by its owner while that owner is still connected; a dead owner's
   // session can be reclaimed (fresh-shell recovery).
   const sessionOwners = new Map();
+  const cancelOnDisconnectSessions = new Set();
+  const activeSessionBySocket = new Map();
 
   const appClient = await AcpClient.connect(cwd, {
     disableBroker: true,
@@ -102,6 +105,22 @@ async function main() {
       send(activeSocket, message);
     }
   });
+
+  function handleSocketDisconnect(socket) {
+    sockets.delete(socket);
+    if (disconnectedSockets.has(socket)) {
+      return;
+    }
+    disconnectedSockets.add(socket);
+    const sessionId = activeSessionBySocket.get(socket);
+    if (
+      sessionId &&
+      cancelOnDisconnectSessions.has(sessionId) &&
+      sessionOwners.get(sessionId) === socket
+    ) {
+      appClient.notify("session/cancel", { sessionId });
+    }
+  }
 
   async function shutdown(server) {
     if (shuttingDown) {
@@ -187,6 +206,11 @@ async function main() {
       }
       sessionOwners.set(sessionId, socket);
       appClient.setSessionPermissionDecision(sessionId, message.params?.decision);
+      if (message.params?.cancelOnDisconnect) {
+        cancelOnDisconnectSessions.add(sessionId);
+      } else {
+        cancelOnDisconnectSessions.delete(sessionId);
+      }
       send(socket, { id: message.id, result: {} });
       return;
     }
@@ -201,6 +225,10 @@ async function main() {
 
     activeSocket = socket;
     activeCount += 1;
+    const promptSessionId = message.method === "session/prompt" ? message.params?.sessionId : null;
+    if (promptSessionId) {
+      activeSessionBySocket.set(socket, promptSessionId);
+    }
     try {
       const result = await appClient.request(message.method, message.params ?? {});
       if (message.method === "session/new" && result?.sessionId) {
@@ -209,6 +237,7 @@ async function main() {
         // over onto a session someone else creates.
         sessionOwners.set(result.sessionId, socket);
         appClient.setSessionPermissionDecision(result.sessionId, "reject");
+        cancelOnDisconnectSessions.delete(result.sessionId);
       }
       send(socket, { id: message.id, result });
     } catch (error) {
@@ -217,10 +246,28 @@ async function main() {
         error: buildJsonRpcError(error.code ?? -32000, error.message, error.data)
       });
     } finally {
+      if (promptSessionId && activeSessionBySocket.get(socket) === promptSessionId) {
+        activeSessionBySocket.delete(socket);
+      }
       activeCount -= 1;
       if (activeCount === 0 && activeSocket === socket) {
         activeSocket = null;
       }
+    }
+  }
+
+  function parseImmediateCancel(line) {
+    try {
+      const message = JSON.parse(line);
+      return message &&
+        typeof message === "object" &&
+        !Array.isArray(message) &&
+        message.id === undefined &&
+        message.method === "session/cancel"
+        ? message
+        : null;
+    } catch {
+      return null;
     }
   }
 
@@ -254,7 +301,13 @@ async function main() {
       buffer += chunk;
       let newlineIndex = buffer.indexOf("\n");
       while (newlineIndex !== -1) {
-        lineQueue.push(buffer.slice(0, newlineIndex));
+        const line = buffer.slice(0, newlineIndex);
+        const immediateCancel = parseImmediateCancel(line);
+        if (immediateCancel) {
+          appClient.notify("session/cancel", immediateCancel.params ?? {});
+        } else {
+          lineQueue.push(line);
+        }
         buffer = buffer.slice(newlineIndex + 1);
         newlineIndex = buffer.indexOf("\n");
       }
@@ -262,11 +315,11 @@ async function main() {
     });
 
     socket.on("close", () => {
-      sockets.delete(socket);
+      handleSocketDisconnect(socket);
     });
 
     socket.on("error", () => {
-      sockets.delete(socket);
+      handleSocketDisconnect(socket);
     });
   });
 

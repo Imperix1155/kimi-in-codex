@@ -229,6 +229,54 @@ await withBroker("slow-prompt", async (session, cwd) => {
   await clientB.close();
 });
 
+// 8b. An explicitly one-shot-owned session opts into disconnect
+// cancellation: destroying its socket sends session/cancel for that exact
+// active session, releases broker busy state, and leaves the legacy test
+// above unchanged for clients that did not opt in.
+{
+  const cancelMarker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "kmc-cancel-marker-")), "cancelled.txt");
+  const previousMarker = process.env.KIMI_FAKE_CANCEL_MARKER;
+  process.env.KIMI_FAKE_CANCEL_MARKER = cancelMarker;
+  try {
+    await withBroker("cancellable", async (session, cwd) => {
+      const clientA = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      const taskSession = await newSession(clientA, cwd);
+      await clientA.setSessionPermissionDecision(taskSession.sessionId, "reject", {
+        cancelOnDisconnect: true
+      });
+      clientA.request("session/prompt", {
+        sessionId: taskSession.sessionId,
+        prompt: [{ type: "text", text: "held one-shot task" }]
+      }).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      clientA.socket.destroy();
+
+      const clientB = await AcpClient.connect(cwd, { brokerEndpoint: session.endpoint });
+      let nextSession = null;
+      const deadline = Date.now() + 2000;
+      while (!nextSession && Date.now() < deadline) {
+        try {
+          nextSession = await clientB.request("session/new", { cwd, mcpServers: [] });
+        } catch (error) {
+          if (error.code !== BROKER_BUSY_RPC_CODE) {
+            throw error;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+      }
+      assert.ok(nextSession?.sessionId, "disconnect cancellation must release broker busy state inside the deadline");
+      assert.equal(fs.readFileSync(cancelMarker, "utf8"), "cancelled\n", "agent must receive session/cancel");
+      await clientB.close();
+    });
+  } finally {
+    if (previousMarker === undefined) {
+      delete process.env.KIMI_FAKE_CANCEL_MARKER;
+    } else {
+      process.env.KIMI_FAKE_CANCEL_MARKER = previousMarker;
+    }
+  }
+}
+
 // 9. Pipelined lines across interleaved chunks are parsed exactly once each
 // (regression for the async-data-handler buffer corruption).
 await withBroker("basic", async (session) => {

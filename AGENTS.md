@@ -4,7 +4,7 @@
 
 A Codex-native plugin that connects Codex to Kimi Code CLI through the existing Agent Client Protocol engine. Public target: `github.com/Imperix1155/kimi-in-codex` (Apache-2.0). The source repository `github.com/Imperix1155/kimi-in-claude-code` is a separate, untouched Claude Code fallback.
 
-The current Codex support boundary is deliberately narrow: `kimi-setup` and foreground `kimi-review` of a caller-supplied frozen diff plus SHA-256 are implemented. Task, mutable-tree review orchestration, job-control, rescue, and hook surfaces remain migration work and must not be described as equivalent.
+The current Codex support boundary is deliberately narrow: `kimi-setup`, foreground `kimi-review` of a caller-supplied frozen diff plus SHA-256, and one foreground `$kimi-task` handoff are implemented. Mutable-tree review orchestration, background or durable task lifecycle, rescue, and hook surfaces remain migration work and must not be described as equivalent.
 
 ## Local contracts
 
@@ -22,6 +22,8 @@ The current Codex support boundary is deliberately narrow: `kimi-setup` and fore
 - Native frozen review reads one artifact buffer, verifies its SHA-256 before Kimi starts, inlines that buffer, and uses an empty temporary ACP session cwd. A missing, mismatched, unavailable, or structurally invalid leg is `NOT REVIEWED`.
 - The Codex review skill must never fall back from frozen evidence to a mutable working tree, branch, or background job.
 - The Codex review skill makes exactly one narrowly elevated foreground runtime call so Kimi can read its existing `~/.kimi` authentication/log state and reach its model service. The process has normal user filesystem authority, not an OS sandbox; the wrapper's read-only claim is limited to its isolated empty session cwd plus verified reject-only ACP permission handling. It must not try inside the sandbox first, redirect credentials, or retry after denial/failure.
+- `$kimi-task` makes one foreground call only. It defaults to read-only ACP permission rejection; write is available only after explicit user edit intent or explicit write selection. Both modes run with normal user filesystem authority, not an OS sandbox, so write approval grants Kimi normal user filesystem write authority rather than a Codex per-tool sandbox approval.
+- `$kimi-task` starts fresh by default and can resume only the exact session ID returned by a successful current-conversation `$kimi-task` call. Its terminal `taskStatus`, result, cancellation, permission evidence, session ID, and touched files belong only to that current call. Background, durable status/result/cancel, and rescue workflows remain deferred.
 - Broker startup failures must retain bounded child exit/signal, stderr/log-tail, and launch-context evidence before cleanup and expose it in the structured `NOT REVIEWED` result.
 - ACP is bidirectional. Every agent-to-client request must receive a response or the turn can hang. Unknown requests receive JSON-RPC `-32601`.
 - Existing state uses `KIMI_COMPANION_DATA`, then the legacy `CLAUDE_PLUGIN_DATA` fallback. Codex-specific `PLUGIN_DATA` behavior is deferred until it is implemented and tested.
@@ -43,6 +45,7 @@ The current Codex support boundary is deliberately narrow: `kimi-setup` and fore
 - `plugins/kimi/.codex-plugin/plugin.json` — advertised Codex components; currently skills only.
 - `plugins/kimi/skills/kimi-setup/` — native setup readiness workflow.
 - `plugins/kimi/skills/kimi-review/` — native SHA-pinned frozen-diff review workflow.
+- `plugins/kimi/skills/kimi-task/` — native foreground one-shot task handoff; default read-only, explicit write, and exact-session resume only.
 - `plugins/kimi/scripts/` — Node/ACP engine and broker/job-control implementation.
 - `plugins/kimi/tests/` — plain Node assertion suites and scripted fake ACP agent.
 - `plugins/kimi/commands/`, `agents/`, `.claude-plugin/`, and `hooks/` — Claude migration source material; not Codex-supported merely because it remains in the tree.

@@ -301,8 +301,12 @@ export async function newSession(client, cwd, options = {}) {
     cwd,
     mcpServers: options.mcpServers ?? []
   });
-  if (options.permissionDecision) {
-    await client.setSessionPermissionDecision(session.sessionId, options.permissionDecision);
+  if (options.permissionDecision || options.cancelOnDisconnect) {
+    await client.setSessionPermissionDecision(
+      session.sessionId,
+      options.permissionDecision ?? "reject",
+      { cancelOnDisconnect: Boolean(options.cancelOnDisconnect) }
+    );
   }
   return session;
 }
@@ -390,6 +394,7 @@ export function isBrokerBusyError(error) {
 // Every setup probe is bounded: a wedged agent must never hang /kimi:setup
 // (env knob exists for tests and slow machines).
 const SETUP_PROBE_TIMEOUT_MS = Number(process.env.KIMI_COMPANION_PROBE_TIMEOUT_MS) || 20_000;
+const CANCELLATION_CONFIRM_TIMEOUT_MS = 2000;
 
 function withProbeDeadline(promise, label) {
   let timer;
@@ -620,83 +625,156 @@ export async function runKimiTurn(cwd, options = {}) {
   const sessionCwd = options.sessionCwd ?? cwd;
 
   return withKimiClient(cwd, async (client) => {
-    const decision = options.write ? "allow" : "reject";
-    let sessionId;
-
-    if (options.resumeSessionId) {
-      emitProgress(options.onProgress, `Loading session ${options.resumeSessionId}.`, "starting");
-      try {
-        await client.request("session/load", { sessionId: options.resumeSessionId, cwd: sessionCwd, mcpServers: [] });
-      } catch (error) {
-        rethrowWithLoginHint(profile, error);
+    let sessionId = options.resumeSessionId ?? null;
+    let promptActive = false;
+    let cancellationTimer = null;
+    let cancellationTimedOut = false;
+    let abortAccepted = Boolean(options.signal?.aborted);
+    const abortHandler = () => {
+      abortAccepted = true;
+      if (promptActive && sessionId) {
+        try {
+          client.notify("session/cancel", { sessionId });
+        } catch {}
       }
-      sessionId = options.resumeSessionId;
-      await client.setSessionPermissionDecision(sessionId, decision);
-    } else {
-      emitProgress(options.onProgress, "Starting Kimi session.", "starting");
-      let session;
-      try {
-        session = await newSession(client, sessionCwd, { permissionDecision: decision });
-      } catch (error) {
-        rethrowWithLoginHint(profile, error);
+      if (!cancellationTimer) {
+        cancellationTimer = setTimeout(() => {
+          cancellationTimedOut = true;
+          void client.close().catch(() => {});
+        }, CANCELLATION_CONFIRM_TIMEOUT_MS);
       }
-      sessionId = session.sessionId;
+    };
+    options.signal?.addEventListener("abort", abortHandler, { once: true });
+    if (options.signal?.aborted) {
+      abortHandler();
     }
 
-    emitProgress(options.onProgress, `Session ready (${sessionId}).`, "starting", { threadId: sessionId });
+    const throwIfAbortedBeforePrompt = () => {
+      if (abortAccepted) {
+        throw new Error("Cancellation unconfirmed: interruption occurred before Kimi started the prompt turn.");
+      }
+    };
 
-    // Model selection is per session via session/set_model with an exact
-    // wire id (verified live 2026-07-17). No flag -> the agent's default.
-    if (options.model) {
-      await client.request("session/set_model", { sessionId, modelId: options.model });
-      emitProgress(options.onProgress, `Model set (${options.model}).`, "starting");
+    try {
+      throwIfAbortedBeforePrompt();
+      const decision = options.write ? "allow" : "reject";
+
+      if (options.resumeSessionId) {
+        emitProgress(options.onProgress, `Loading session ${options.resumeSessionId}.`, "starting");
+        try {
+          await client.request("session/load", { sessionId: options.resumeSessionId, cwd: sessionCwd, mcpServers: [] });
+        } catch (error) {
+          rethrowWithLoginHint(profile, error);
+        }
+        sessionId = options.resumeSessionId;
+        await client.setSessionPermissionDecision(sessionId, decision, {
+          cancelOnDisconnect: Boolean(options.cancelOnDisconnect)
+        });
+      } else {
+        emitProgress(options.onProgress, "Starting Kimi session.", "starting");
+        let session;
+        try {
+          session = await newSession(client, sessionCwd, {
+            permissionDecision: decision,
+            cancelOnDisconnect: Boolean(options.cancelOnDisconnect)
+          });
+        } catch (error) {
+          rethrowWithLoginHint(profile, error);
+        }
+        sessionId = session.sessionId;
+      }
+
+      throwIfAbortedBeforePrompt();
+      emitProgress(options.onProgress, `Session ready (${sessionId}).`, "starting", { threadId: sessionId });
+
+      // Model selection is per session via session/set_model with an exact
+      // wire id (verified live 2026-07-17). No flag -> the agent's default.
+      if (options.model) {
+        await client.request("session/set_model", { sessionId, modelId: options.model });
+        emitProgress(options.onProgress, `Model set (${options.model}).`, "starting");
+      }
+      throwIfAbortedBeforePrompt();
+
+      const basePrompt = options.preservePromptWhitespace && options.prompt
+        ? options.prompt
+        : options.prompt?.trim() || options.defaultPrompt || "";
+      if (!basePrompt) {
+        throw new Error("A prompt is required for this Kimi run.");
+      }
+      // Applied after prompt/defaultPrompt resolution so resumed turns get it
+      // too. Callers own the choice: the review AND stop-gate templates carry
+      // their own tool_availability rules and must not be double-preambled.
+      const prompt = options.promptPreamble ? `${options.promptPreamble}${basePrompt}` : basePrompt;
+
+      promptActive = true;
+      let result;
+      try {
+        result = await runPromptTurn(client, { sessionId, prompt, onProgress: options.onProgress });
+      } finally {
+        promptActive = false;
+      }
+
+      // KMP-27: rejection-abort recovery. Deterministic trigger — at least one
+      // rejected permission this turn AND no agent message at all (the silent
+      // abort leaves only the rejection tool output). One continuation on the
+      // same session, never a loop. Callers opt in alongside the preamble.
+      if (
+        options.continueAfterRejectionAbort &&
+        !result.agentMessage.trim() &&
+        permissionEvents.some((event) => event.decision !== "allow")
+      ) {
+        emitProgress(
+          options.onProgress,
+          "Turn ended silently after policy rejections — sending one continuation prompt.",
+          "investigating"
+        );
+        throwIfAbortedBeforePrompt();
+        promptActive = true;
+        let followUp;
+        try {
+          followUp = await runPromptTurn(client, {
+            sessionId,
+            prompt: REJECTION_CONTINUATION_PROMPT,
+            onProgress: options.onProgress
+          });
+        } finally {
+          promptActive = false;
+        }
+        // Merge so the first turn's tool activity (including the rejection
+        // evidence) stays visible alongside the recovered answer.
+        result = {
+          ...followUp,
+          toolCalls: [...result.toolCalls, ...followUp.toolCalls],
+          toolOutputs: [...result.toolOutputs, ...followUp.toolOutputs],
+          reasoning: [result.reasoning, followUp.reasoning].filter(Boolean).join("\n\n"),
+          touchedFiles: [...new Set([...result.touchedFiles, ...followUp.touchedFiles])],
+          unknownUpdateKinds: [...new Set([...result.unknownUpdateKinds, ...followUp.unknownUpdateKinds])],
+          hasContent: result.hasContent || followUp.hasContent,
+          plan: followUp.plan.length > 0 ? followUp.plan : result.plan
+        };
+      }
+
+      if (options.signal?.aborted && result.stopReason !== "cancelled") {
+        throw new Error(`Cancellation unconfirmed: Kimi stopped with ${result.stopReason ?? "no stop reason"}.`);
+      }
+      return { ...result, sessionId, stderr: client.stderr ?? "", permissionEvents };
+    } catch (error) {
+      if (options.signal?.aborted) {
+        if (/^Cancellation unconfirmed:/i.test(String(error?.message ?? ""))) {
+          throw error;
+        }
+        const detail = cancellationTimedOut
+          ? `Kimi did not confirm cancellation within ${CANCELLATION_CONFIRM_TIMEOUT_MS}ms.`
+          : (error instanceof Error ? error.message : String(error));
+        throw new Error(`Cancellation unconfirmed: ${detail}`);
+      }
+      throw error;
+    } finally {
+      if (cancellationTimer) {
+        clearTimeout(cancellationTimer);
+      }
+      options.signal?.removeEventListener("abort", abortHandler);
     }
-
-    const basePrompt = options.prompt?.trim() || options.defaultPrompt || "";
-    if (!basePrompt) {
-      throw new Error("A prompt is required for this Kimi run.");
-    }
-    // Applied after prompt/defaultPrompt resolution so resumed turns get it
-    // too. Callers own the choice: the review AND stop-gate templates carry
-    // their own tool_availability rules and must not be double-preambled.
-    const prompt = options.promptPreamble ? `${options.promptPreamble}${basePrompt}` : basePrompt;
-
-    let result = await runPromptTurn(client, { sessionId, prompt, onProgress: options.onProgress });
-
-    // KMP-27: rejection-abort recovery. Deterministic trigger — at least one
-    // rejected permission this turn AND no agent message at all (the silent
-    // abort leaves only the rejection tool output). One continuation on the
-    // same session, never a loop. Callers opt in alongside the preamble.
-    if (
-      options.continueAfterRejectionAbort &&
-      !result.agentMessage.trim() &&
-      permissionEvents.some((event) => event.decision !== "allow")
-    ) {
-      emitProgress(
-        options.onProgress,
-        "Turn ended silently after policy rejections — sending one continuation prompt.",
-        "investigating"
-      );
-      const followUp = await runPromptTurn(client, {
-        sessionId,
-        prompt: REJECTION_CONTINUATION_PROMPT,
-        onProgress: options.onProgress
-      });
-      // Merge so the first turn's tool activity (including the rejection
-      // evidence) stays visible alongside the recovered answer.
-      result = {
-        ...followUp,
-        toolCalls: [...result.toolCalls, ...followUp.toolCalls],
-        toolOutputs: [...result.toolOutputs, ...followUp.toolOutputs],
-        reasoning: [result.reasoning, followUp.reasoning].filter(Boolean).join("\n\n"),
-        touchedFiles: [...new Set([...result.touchedFiles, ...followUp.touchedFiles])],
-        unknownUpdateKinds: [...new Set([...result.unknownUpdateKinds, ...followUp.unknownUpdateKinds])],
-        hasContent: result.hasContent || followUp.hasContent,
-        plan: followUp.plan.length > 0 ? followUp.plan : result.plan
-      };
-    }
-
-    return { ...result, sessionId, stderr: client.stderr ?? "", permissionEvents };
   }, clientOptions);
 }
 

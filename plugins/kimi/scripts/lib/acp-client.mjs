@@ -75,7 +75,7 @@ class AcpClientBase {
     this.permissionDecision = decision === "allow" ? "allow" : "reject";
   }
 
-  setSessionPermissionDecision(sessionId, decision) {
+  setSessionPermissionDecision(sessionId, decision, _options = {}) {
     if (sessionId == null) {
       return;
     }
@@ -413,9 +413,13 @@ class BrokerAcpClient extends AcpClientBase {
 
   // Permission answers happen broker-side, so the policy must live there
   // too. Returns a promise; await it before starting the session's turn.
-  setSessionPermissionDecision(sessionId, decision) {
-    super.setSessionPermissionDecision(sessionId, decision);
-    return this.request("broker/session_policy", { sessionId, decision });
+  setSessionPermissionDecision(sessionId, decision, options = {}) {
+    super.setSessionPermissionDecision(sessionId, decision, options);
+    return this.request("broker/session_policy", {
+      sessionId,
+      decision,
+      cancelOnDisconnect: Boolean(options.cancelOnDisconnect)
+    });
   }
 
   async close() {

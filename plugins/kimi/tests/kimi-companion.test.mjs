@@ -185,6 +185,14 @@ function pathToImport(relative) {
   assert.notEqual(concurrent.status, 0);
   assert.match(concurrent.stdout + concurrent.stderr, /busy with another turn/);
 
+  const oneShotConcurrent = runCli(["task", "--codex-once", "--json", "second one-shot"], { env, cwd });
+  assert.notEqual(oneShotConcurrent.status, 0);
+  const oneShotBusy = JSON.parse(oneShotConcurrent.stdout);
+  assert.equal(oneShotBusy.taskStatus, "FAILED");
+  assert.match(oneShotBusy.error, /foreground one-shot/i);
+  assert.match(oneShotBusy.error, /no durable (?:status|lifecycle|job)/i);
+  assert.doesNotMatch(oneShotBusy.error, /\/kimi:status|\/kimi:cancel|job-id/i);
+
   const completed = await pollUntil(() => {
     const status = runCli(["status", jobId, "--json"], { env, cwd });
     const snapshot = status.status === 0 ? JSON.parse(status.stdout) : null;
@@ -281,6 +289,27 @@ function pathToImport(relative) {
   const setup = runCli(["setup"], { env, cwd });
   assert.equal(setup.status, 0, "bare setup now runs the probes");
   assert.match(setup.stdout, /# Kimi Setup/);
+
+  const help = runCli(["help"], { env, cwd });
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /kimi-companion\.mjs setup \[--json\]/);
+  assert.doesNotMatch(help.stdout, /Not yet available|KMP-12/);
+
+  const unavailableEnv = { ...env, PATH: "/usr/bin:/bin" };
+  delete unavailableEnv.KIMI_COMPANION_AGENT_SPAWN;
+  const unavailable = runCli(["task", "--codex-once", "--json", "x"], { env: unavailableEnv, cwd });
+  assert.notEqual(unavailable.status, 0);
+  const unavailablePayload = JSON.parse(unavailable.stdout);
+  assert.equal(unavailablePayload.taskStatus, "FAILED");
+  assert.match(unavailablePayload.error, /\$kimi-setup/);
+  assert.doesNotMatch(unavailablePayload.error, /\/kimi:setup|\/kimi:status|\/kimi:cancel/);
+
+  const emptyOneShot = runCli(["task", "--codex-once", "--json"], { env, cwd });
+  assert.notEqual(emptyOneShot.status, 0);
+  const emptyOneShotPayload = JSON.parse(emptyOneShot.stdout);
+  assert.equal(emptyOneShotPayload.taskStatus, "FAILED");
+  assert.match(emptyOneShotPayload.error, /prompt.*--resume-session/i);
+  assert.doesNotMatch(emptyOneShotPayload.error, /resume-last/);
 }
 
 // 6b. --model alias resolves to the wire id and reaches the agent via
@@ -413,6 +442,294 @@ function pathToImport(relative) {
   assert.equal(payload.permissionEvents[0].decision, "reject");
   assert.ok((payload.toolOutputs ?? []).some((t) => /rejected by the user/.test(t.text ?? "")), "first turn's rejection evidence must survive the merge");
   shutdownBroker(env, cwd);
+}
+
+// 7f. Codex foreground one-shot tasks are read-only by default, return a
+// terminal taskStatus envelope, preserve prompt-file bytes, and never create
+// a durable task record. This fails if the one-shot path starts using the
+// legacy tracked-job flow or accidentally grants write permission.
+{
+  const { cwd, env } = makeWorkspace("permission-standard");
+  const before = JSON.parse(runCli(["status", "--json", "--all"], { env, cwd }).stdout);
+  const run = runCli([
+    "task", "--codex-once", "--json", "one-shot read-only task"
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const payload = JSON.parse(run.stdout);
+  assert.equal(payload.taskStatus, "COMPLETED");
+  assert.equal(payload.sessionId, "sess-1");
+  assert.equal(payload.permissionEvents[0].decision, "reject");
+  const after = JSON.parse(runCli(["status", "--json", "--all"], { env, cwd }).stdout);
+  assert.deepEqual(after.running, before.running);
+  assert.deepEqual(after.latestFinished, before.latestFinished);
+  assert.deepEqual(after.recent, before.recent);
+  shutdownBroker(env, cwd);
+}
+{
+  const { cwd, env } = makeWorkspace("prompt-echo");
+  const prompt = '\n  leading-space\n"quoted" \\backslash --write\ntrailing-space  \n';
+  const promptFile = path.join(cwd, "one-shot-prompt.txt");
+  fs.writeFileSync(promptFile, prompt, "utf8");
+  const run = runCli([
+    "task", "--codex-once", "--json", "--prompt-file", promptFile
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const echoed = JSON.parse(run.stdout).rawOutput.slice("PROMPT-ECHO:".length);
+  assert.match(echoed, /READ-ONLY task/, "read-only preamble must precede the prompt-file content");
+  assert.equal(echoed.slice(-prompt.length), prompt, "prompt-file boundary whitespace must reach Kimi unchanged after the preamble");
+  shutdownBroker(env, cwd);
+}
+
+// 7g. One-shot write and model selections flow through the same foreground
+// session, but only an explicit --write may select an allow permission.
+{
+  const { cwd, env } = makeWorkspace("permission-standard");
+  const run = runCli([
+    "task", "--codex-once", "--write", "--json", "edit exactly this file"
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const payload = JSON.parse(run.stdout);
+  assert.equal(payload.taskStatus, "COMPLETED");
+  assert.equal(payload.permissionEvents[0].decision, "allow");
+  shutdownBroker(env, cwd);
+}
+{
+  const { cwd, env } = makeWorkspace("model-check");
+  const run = runCli([
+    "task", "--codex-once", "--model", "highspeed", "--json", "use the selected model"
+  ], { env, cwd });
+  assert.equal(run.status, 0, run.stderr);
+  const payload = JSON.parse(run.stdout);
+  assert.equal(payload.taskStatus, "COMPLETED");
+  assert.match(payload.rawOutput, /model:kimi-code\/kimi-for-coding-highspeed,thinking/);
+  shutdownBroker(env, cwd);
+}
+
+// 7h. One-shot resume is exact-session-only. It must reuse the session id
+// returned by the fresh task and reject legacy repository-history selectors.
+{
+  const { cwd, env } = makeWorkspace("resume-check");
+  const fresh = runCli([
+    "task", "--codex-once", "--fresh", "--json", "start the exact session"
+  ], { env, cwd });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  const firstPayload = JSON.parse(fresh.stdout);
+  assert.equal(firstPayload.taskStatus, "COMPLETED");
+  assert.match(firstPayload.rawOutput, /fresh-session/);
+
+  // This is the documented shell-array expansion shape: the flag and exact
+  // session ID are separate argv elements, so Kimi must issue session/load.
+  const documentedResumeArgs = ["--resume-session", firstPayload.sessionId];
+  const resumed = runCli([
+    "task", "--codex-once", ...documentedResumeArgs, "--json"
+  ], { env, cwd });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const resumedPayload = JSON.parse(resumed.stdout);
+  assert.equal(resumedPayload.taskStatus, "COMPLETED");
+  assert.equal(resumedPayload.sessionId, firstPayload.sessionId);
+  assert.match(resumedPayload.rawOutput, /resumed-session/);
+  assert.doesNotMatch(resumedPayload.rawOutput, /fresh-session/);
+
+  for (const args of [
+    ["--codex-once", "--background", "x"],
+    ["--codex-once", "--resume-last"],
+    ["--codex-once", "--resume"],
+    ["--codex-once", "--fresh", "--resume-session", "sess-1", "x"]
+  ]) {
+    const invalid = runCli(["task", "--json", ...args], { env, cwd });
+    assert.notEqual(invalid.status, 0, `one-shot arguments must fail: ${args.join(" ")}`);
+    assert.equal(JSON.parse(invalid.stdout).taskStatus, "FAILED");
+  }
+
+  // One-shot output is JSON-only, so --json is required up front; the error
+  // is plain text on stderr because no JSON output was requested.
+  const missingJson = runCli(["task", "--codex-once", "x"], { env, cwd });
+  assert.notEqual(missingJson.status, 0, "one-shot without --json must fail");
+  assert.match(missingJson.stderr, /require --json/);
+  assert.equal(missingJson.stdout.trim(), "");
+
+  // --codex-once=false is NOT one-shot intent (parseArgs semantics): a
+  // failure on the resulting legacy path must not emit the one-shot envelope.
+  const disabledOnce = runCli(["task", "--json", "--codex-once=false", "--resume-last"], { env, cwd });
+  assert.notEqual(disabledOnce.status, 0, "legacy resume-last with no prior task must fail");
+  assert.equal(Object.hasOwn(JSON.parse(disabledOnce.stdout), "taskStatus"), false);
+  shutdownBroker(env, cwd);
+}
+
+// 7i. One-shot process interruption is graceful and confirmed by ACP: both
+// supported signals return a CANCELLED JSON result, stop the fake delayed
+// write before it reaches normal completion, and release the broker for the
+// next foreground task.
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  const { cwd, env: baseEnv } = makeWorkspace("cancel-write-delay");
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-one-shot-cancel-"));
+  const promptMarker = path.join(markerDir, "prompt-active.txt");
+  const cancelMarker = path.join(markerDir, "cancel-received.txt");
+  const postCancelMarker = path.join(markerDir, "post-cancel-write.txt");
+  // The fixture's delayed write must stay comfortably ahead of poll and
+  // scheduling jitter on loaded CI hosts; the post-exit negative check below
+  // waits past this same delay so "no post-cancel write" stays meaningful.
+  const cancelWriteDelayMs = 3000;
+  const env = {
+    ...baseEnv,
+    KIMI_FAKE_PROMPT_MARKER: promptMarker,
+    KIMI_FAKE_CANCEL_MARKER: cancelMarker,
+    KIMI_FAKE_POST_CANCEL_MARKER: postCancelMarker,
+    KIMI_FAKE_CANCEL_WRITE_DELAY_MS: String(cancelWriteDelayMs)
+  };
+  const child = spawn(process.execPath, [
+    CLI, "task", "--codex-once", "--write", "--json", `interrupt with ${signal}`
+  ], { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitPromise = new Promise((resolve) => {
+    child.on("exit", (code, exitSignal) => resolve({ code, signal: exitSignal }));
+  });
+
+  const promptActive = await pollUntil(() => fs.existsSync(promptMarker), 5000, 25);
+  assert.ok(promptActive, `${signal} fixture never reached its active prompt`);
+  assert.equal(child.kill(signal), true, `${signal} was not delivered to the one-shot process`);
+  const exited = await Promise.race([
+    exitPromise,
+    new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+  ]);
+  if (!exited) {
+    child.kill("SIGKILL");
+  }
+  assert.ok(exited, `${signal} one-shot process did not exit inside the deadline`);
+  assert.notEqual(exited.code, 0, `${signal} cancellation must exit nonzero; stdout: ${stdout}; stderr: ${stderr}`);
+
+  await new Promise((resolve) => setTimeout(resolve, cancelWriteDelayMs + 250));
+  assert.deepEqual(
+    { cancelReceived: fs.existsSync(cancelMarker), postCancelWrite: fs.existsSync(postCancelMarker) },
+    { cancelReceived: true, postCancelWrite: false },
+    `${signal} must reach ACP cancellation and prevent delayed post-cancel work`
+  );
+  const payload = JSON.parse(stdout);
+  assert.equal(payload.taskStatus, "CANCELLED", `${signal} stdout: ${stdout}\nstderr: ${stderr}`);
+  assert.equal(payload.stopReason, "cancelled");
+
+  const next = runCli(["task", "--codex-once", "--json", "next task after cancellation"], { env, cwd });
+  assert.equal(next.status, 0, `${signal} left the broker busy: ${next.stderr}`);
+  assert.equal(JSON.parse(next.stdout).taskStatus, "COMPLETED");
+  shutdownBroker(env, cwd);
+}
+
+// 7j. A non-cooperative agent cannot hold the one-shot CLI open forever.
+// The signal still reaches ACP, but without a cancelled stopReason the
+// terminal result is FAILED with explicit unconfirmed-cancellation evidence.
+{
+  const { cwd, env: baseEnv } = makeWorkspace("cancel-unconfirmed");
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-one-shot-unconfirmed-"));
+  const promptMarker = path.join(markerDir, "prompt-active.txt");
+  const cancelMarker = path.join(markerDir, "cancel-received.txt");
+  const env = {
+    ...baseEnv,
+    KIMI_FAKE_PROMPT_MARKER: promptMarker,
+    KIMI_FAKE_CANCEL_MARKER: cancelMarker
+  };
+  const child = spawn(process.execPath, [
+    CLI, "task", "--codex-once", "--json", "ignore this cancellation"
+  ], { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitPromise = new Promise((resolve) => {
+    child.on("exit", (code, exitSignal) => resolve({ code, signal: exitSignal }));
+  });
+
+  assert.ok(await pollUntil(() => fs.existsSync(promptMarker), 5000, 25), "unconfirmed fixture never reached its active prompt");
+  assert.equal(child.kill("SIGINT"), true);
+  const exited = await Promise.race([
+    exitPromise,
+    new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+  ]);
+  if (!exited) {
+    child.kill("SIGKILL");
+  }
+  assert.ok(exited, "unconfirmed cancellation did not exit inside the bounded deadline");
+  assert.notEqual(exited.code, 0);
+  assert.ok(await pollUntil(() => fs.existsSync(cancelMarker), 1000, 25), "unconfirmed cancellation never reached ACP");
+  const payload = JSON.parse(stdout);
+  assert.equal(payload.taskStatus, "FAILED", `stdout: ${stdout}\nstderr: ${stderr}`);
+  assert.match(payload.error, /cancellation unconfirmed/i);
+  shutdownBroker(env, cwd);
+}
+
+// 7k. Signal acceptance is bounded even before a session is ready. A hung
+// session/new or session/load must return structured FAILED evidence rather
+// than swallowing SIGINT forever, and the unresolved broker request must
+// remain truthfully busy rather than being cleared without agent confirmation.
+for (const testCase of [
+  {
+    label: "session/new",
+    scenario: "hang-session",
+    markerEnv: "KIMI_SESSION_CWD_MARKER",
+    args: ["task", "--codex-once", "--json", "hang while creating a session"]
+  },
+  {
+    label: "session/load",
+    scenario: "hang-session-load",
+    markerEnv: "KIMI_SESSION_LOAD_MARKER",
+    args: ["task", "--codex-once", "--resume-session", "sess-existing", "--json"]
+  }
+]) {
+  const { cwd, env: baseEnv } = makeWorkspace(testCase.scenario);
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), "kmc-pre-session-cancel-"));
+  const requestMarker = path.join(markerDir, "request-active.txt");
+  const env = { ...baseEnv, [testCase.markerEnv]: requestMarker };
+  const child = spawn(process.execPath, [CLI, ...testCase.args], {
+    env,
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const exitPromise = new Promise((resolve) => {
+    child.on("exit", (code, exitSignal) => resolve({ code, signal: exitSignal }));
+  });
+
+  try {
+    assert.ok(
+      await pollUntil(() => fs.existsSync(requestMarker), 5000, 25),
+      `${testCase.label} fixture never reached its hanging request`
+    );
+    assert.equal(child.kill("SIGINT"), true, `${testCase.label} did not accept SIGINT`);
+    const exited = await Promise.race([
+      exitPromise,
+      new Promise((resolve) => setTimeout(() => resolve(null), 5000))
+    ]);
+    if (!exited) {
+      child.kill("SIGKILL");
+    }
+    assert.ok(exited, `${testCase.label} interruption was not bounded`);
+    assert.notEqual(exited.code, 0, `${testCase.label} interruption must exit nonzero`);
+    const payload = JSON.parse(stdout);
+    assert.equal(payload.taskStatus, "FAILED", `${testCase.label} stdout: ${stdout}\nstderr: ${stderr}`);
+    assert.match(payload.error, /cancellation unconfirmed/i);
+
+    const next = runCli(["task", "--codex-once", "--json", "probe broker truth"], { env, cwd });
+    assert.notEqual(next.status, 0, `${testCase.label} falsely released an unresolved broker request`);
+    const nextPayload = JSON.parse(next.stdout);
+    assert.equal(nextPayload.taskStatus, "FAILED");
+    assert.match(nextPayload.error, /busy with another turn/i);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+    }
+    shutdownBroker(env, cwd);
+  }
 }
 
 // 8. Externally killed worker: status must reconcile the record to failed

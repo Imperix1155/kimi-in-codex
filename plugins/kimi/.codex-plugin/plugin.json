@@ -1,7 +1,7 @@
 {
   "name": "kimi",
   "version": "0.1.5",
-  "description": "Check Kimi readiness and review verified frozen diffs from Codex.",
+  "description": "Check Kimi readiness, review verified frozen diffs, and run a foreground task handoff from Codex.",
   "author": {
     "name": "Imperix1155",
     "url": "https://github.com/Imperix1155"
@@ -9,16 +9,16 @@
   "homepage": "https://github.com/Imperix1155/kimi-in-codex#readme",
   "repository": "https://github.com/Imperix1155/kimi-in-codex",
   "license": "Apache-2.0",
-  "keywords": ["kimi", "codex", "setup", "review"],
+  "keywords": ["kimi", "codex", "setup", "review", "task", "handoff"],
   "skills": "./skills/",
   "interface": {
     "displayName": "Kimi",
-    "shortDescription": "Prepare Kimi and review frozen diffs.",
-    "longDescription": "Verify local Kimi readiness and run foreground adversarial reviews against a frozen saved diff whose SHA-256 is verified before Kimi starts. Task delegation, background job control, rescue, and hooks are not yet included.",
+    "shortDescription": "Prepare Kimi, review frozen diffs, or hand off one foreground task.",
+    "longDescription": "Verify local Kimi readiness, run foreground adversarial reviews against a frozen saved diff whose SHA-256 is verified before Kimi starts, and hand off one foreground task with explicit access controls. Background and durable lifecycle APIs are not included.",
     "developerName": "Imperix1155",
     "category": "Productivity",
-    "capabilities": ["Read"],
+    "capabilities": ["Read", "Write"],
     "websiteURL": "https://github.com/Imperix1155/kimi-in-codex",
-    "defaultPrompt": ["Use Kimi Setup to check readiness or Kimi Review to review a verified frozen diff."]
+    "defaultPrompt": ["Use Kimi Setup to check readiness, Kimi Review to review a verified frozen diff, or Kimi Task for one foreground task handoff."]
   }
 }

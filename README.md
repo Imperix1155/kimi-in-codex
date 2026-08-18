@@ -2,7 +2,7 @@
 
 Use [Kimi Code CLI](https://github.com/MoonshotAI/kimi-code) from Codex through a native Codex plugin package built on the existing Agent Client Protocol engine.
 
-> **Status: early Codex port.** Native `$kimi-setup` and foreground `$kimi-review` of a SHA-256-pinned frozen diff are implemented and testable. Task delegation, mutable-tree review orchestration, background job controls, rescue behavior, and lifecycle hooks are not yet ported or claimed equivalent. The fully working Claude Code version remains available at [Imperix1155/kimi-in-claude-code](https://github.com/Imperix1155/kimi-in-claude-code).
+> **Status: early Codex port.** Native `$kimi-setup`, foreground `$kimi-review` of a SHA-256-pinned frozen diff, and one foreground `$kimi-task` handoff are implemented. Mutable-tree review orchestration, background and durable task lifecycle, rescue behavior, and lifecycle hooks remain deferred and are not claimed equivalent. The fully working Claude Code version remains available at [Imperix1155/kimi-in-claude-code](https://github.com/Imperix1155/kimi-in-claude-code).
 
 ## Requirements
 
@@ -37,15 +37,18 @@ Each review requests one narrowly justified elevated Codex shell execution so th
 
 Any missing artifact, malformed or mismatched digest, unavailable Kimi/auth, permission-policy regression, or invalid structured response exits nonzero as `NOT REVIEWED`. The skill never falls back to a live Git diff.
 
+Invoke `$kimi-task` to hand Kimi one bounded foreground task. It defaults to read-only: the ACP client rejects mutation and shell/execute permission requests. Use write mode only after the user explicitly asks Kimi to edit files or otherwise mutate state. Each task is one elevated foreground call with normal user filesystem authority, not an OS sandbox; read-only is an ACP permission boundary, not operating-system confinement.
+
+Tasks start fresh by default. Resume is available only with the exact session ID returned by a successful `$kimi-task` call in the current conversation; the skill never guesses a session, scans history, or uses resume-last. The current call owns its terminal `taskStatus`, result, permission events, session ID, and touched files. It does not provide background execution, durable status/result/cancel APIs, or rescue behavior.
+
 ## Not yet ported
 
 The copied engine already implements these behaviors for Claude Code, but their Codex-native wrappers and semantics still require separate implementation and verification:
 
-- task delegation
 - automatic diff freezing and SHA-pinned coverage-ledger orchestration
 - mutable working-tree or branch review through the Codex skill
-- background status, result, and cancellation workflows
-- rescue subagent routing
+- background and durable status, result, and cancellation workflows
+- rescue subagent routing and rescue fallback behavior
 - slash-command arguments and interactive choice flows
 - SessionStart, SessionEnd, and Stop hooks
 - Codex-specific plugin data/state naming
@@ -58,6 +61,7 @@ Legacy Claude packaging remains in the target tree only as migration source mate
 - `plugins/kimi/.codex-plugin/plugin.json` — native Codex plugin manifest
 - `plugins/kimi/skills/kimi-setup/` — the supported Codex setup workflow
 - `plugins/kimi/skills/kimi-review/` — foreground review of a verified frozen diff
+- `plugins/kimi/skills/kimi-task/` — one foreground task handoff with explicit access controls
 - `.agents/plugins/marketplace.json` — repository marketplace catalog
 - `plugins/kimi/scripts/` — proven Node/ACP engine retained from the source history
 - `plugins/kimi/tests/` — deterministic engine and package-surface tests

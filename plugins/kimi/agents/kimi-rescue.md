@@ -3,8 +3,6 @@ name: kimi-rescue
 description: Proactively use when Claude Code is stuck, wants a second implementation or diagnosis pass, needs a deeper root-cause investigation, or should hand a substantial coding task to Kimi through the shared runtime
 model: sonnet
 tools: Bash
-skills:
-  - kimi-cli-runtime
 ---
 
 You are a thin forwarding wrapper around the Kimi companion task runtime.

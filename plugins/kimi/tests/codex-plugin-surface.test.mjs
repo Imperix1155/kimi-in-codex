@@ -20,10 +20,61 @@ for (const unsupported of ["hooks", "mcpServers", "apps"]) {
   assert.ok(!(unsupported in manifest), `setup slice must not advertise ${unsupported}`);
 }
 
+const nativeSkillsRoot = path.join(pluginRoot, "skills");
+const packagedNativeSkills = fs.readdirSync(nativeSkillsRoot, { withFileTypes: true })
+  .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+  .map((entry) => entry.name)
+  .sort();
+assert.deepEqual(
+  packagedNativeSkills,
+  ["kimi-review", "kimi-setup", "kimi-task"],
+  "Codex discovery must expose exactly the approved native skill set"
+);
+const packagedNativeSkillText = packagedNativeSkills
+  .map((name) => fs.readFileSync(path.join(nativeSkillsRoot, name, "SKILL.md"), "utf8"))
+  .join("\n");
+for (const legacyGuidance of [
+  /CLAUDE_PLUGIN_ROOT/,
+  /\/kimi:/,
+  /--resume-last/,
+  /default to a write-capable/i,
+  /(?:add|pass).*--background/i
+]) {
+  assert.doesNotMatch(packagedNativeSkillText, legacyGuidance);
+}
+
 const marketplace = readJson(path.join(repoRoot, ".agents", "plugins", "marketplace.json"));
 assert.equal(marketplace.name, "imperix");
 assert.equal(marketplace.plugins.length, 1);
 assert.deepEqual(marketplace.plugins[0].source, { source: "local", path: "./plugins/kimi" });
+
+// The repository's public and maintainer documents must describe the same
+// deliberately narrow task surface that the native manifest exposes.
+const readme = fs.readFileSync(path.join(repoRoot, "README.md"), "utf8");
+const agents = fs.readFileSync(path.join(repoRoot, "AGENTS.md"), "utf8");
+const buildPlan = fs.readFileSync(path.join(repoRoot, "docs", "PLAN.md"), "utf8");
+const roadmap = fs.readFileSync(path.join(repoRoot, "docs", "ROADMAP.md"), "utf8");
+for (const document of [readme, agents, buildPlan]) {
+  assert.match(document, /\$kimi-task/);
+  assert.match(document, /foreground(?:-only)?/i);
+  assert.match(document, /default.*read-only|read-only.*default/i);
+  assert.match(document, /normal user filesystem authority/i);
+  assert.match(document, /not (?:an )?OS sandbox/i);
+  assert.match(document, /exact(?:-session)?(?:-only)? resume|exact session ID/i);
+  assert.match(document, /background.*durable.*deferred|durable.*background.*deferred/i);
+  assert.match(document, /rescue.*deferred|deferred.*rescue/i);
+}
+assert.match(agents, /plugins\/kimi\/skills\/kimi-task/);
+assert.match(roadmap, /- \[x\] \*\*KMP-30\*\* ✅ 2026-08-16/);
+assert.match(roadmap, /Phase 5 acceptance gate \(passed\)/);
+assert.match(roadmap, /stale fake broker\/agent processes.*b37c/i);
+assert.match(roadmap, /exact-head full suites/i);
+assert.match(roadmap, /c1f810bfdb4e740cf5e4c7c95d44bf659a57bb61/);
+assert.match(roadmap, /four live Kimi 1\.49 canaries/i);
+assert.match(roadmap, /whole-branch review.*native skill set/i);
+assert.match(roadmap, /Integration verification \(PR #3/);
+assert.match(roadmap, /781c6c309cfbfd3aab599530cd607512d42e42a9/);
+assert.match(roadmap, /skill validators.*exited zero|validators.*exited zero/i);
 
 const skillPath = path.join(pluginRoot, "skills", "kimi-setup", "SKILL.md");
 assert.ok(fs.existsSync(skillPath), "kimi-setup skill must exist");
@@ -76,8 +127,55 @@ const reviewMetadata = fs.readFileSync(path.join(pluginRoot, "skills", "kimi-rev
 assert.match(reviewMetadata, /display_name: "Kimi Review"/);
 assert.match(reviewMetadata, /\$kimi-review/);
 
+const taskSkillPath = path.join(pluginRoot, "skills", "kimi-task", "SKILL.md");
+assert.ok(fs.existsSync(taskSkillPath), "kimi-task skill must exist");
+const taskSkill = fs.readFileSync(taskSkillPath, "utf8");
+const taskFrontmatter = taskSkill.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
+assert.deepEqual(
+  taskFrontmatter.split("\n").map((line) => line.split(":", 1)[0]),
+  ["name", "description"],
+  "task skill frontmatter must contain only name and description"
+);
+assert.match(taskSkill, /task --codex-once --json/);
+assert.match(
+  taskSkill,
+  /SESSION_ARGS=\(--resume-session "\$\{SESSION_ID\}"\)/,
+  "task skill must construct --resume-session and its exact ID as separate argv elements"
+);
+assert.match(
+  taskSkill,
+  /"\$\{SESSION_ARGS\[@\]\}"/,
+  "task skill must expand session arguments without word splitting"
+);
+assert.doesNotMatch(
+  taskSkill,
+  /"\$\{SESSION_FLAG\}"/,
+  "task skill must not pass a compound resume flag as one argv element"
+);
+assert.equal(
+  taskSkill.match(/node "\$\{PLUGIN_ROOT\}\/scripts\/kimi-companion\.mjs" "\$\{TASK_ARGS\[@\]\}"/g)?.length,
+  1,
+  "task skill must invoke the constructed argv exactly once"
+);
+assert.match(taskSkill, /sandbox_permissions:\s*["`]require_escalated["`]/);
+assert.match(taskSkill, /default.*read-only/i);
+assert.match(taskSkill, /normal user filesystem authority/i);
+assert.match(taskSkill, /not (?:an )?OS sandbox/i);
+assert.match(taskSkill, /--resume-session/);
+assert.match(taskSkill, /background.*not supported|not support.*background/i);
+assert.doesNotMatch(taskSkill, /\$kimi-status|\$kimi-result|\$kimi-cancel/);
+assert.doesNotMatch(taskSkill, /\$ARGUMENTS|AskUserQuestion|CLAUDE_PLUGIN_ROOT/);
+
+const taskMetadata = fs.readFileSync(path.join(pluginRoot, "skills", "kimi-task", "agents", "openai.yaml"), "utf8");
+assert.match(taskMetadata, /display_name: "Kimi Task"/);
+assert.match(taskMetadata, /\$kimi-task/);
+
 assert.match(manifest.description, /review/i);
+assert.match(manifest.description, /task handoff/i);
+assert.match(manifest.interface.defaultPrompt.join(" "), /task handoff/i);
 assert.match(manifest.interface.longDescription, /frozen/i);
-assert.match(manifest.interface.longDescription, /not included|not yet/i);
+assert.match(manifest.interface.longDescription, /background.*lifecycle.*not included/i);
+assert.ok(manifest.interface.capabilities.includes("Read"));
+assert.ok(manifest.interface.capabilities.includes("Write"));
 
 console.log("CODEX-PLUGIN-SURFACE-GREEN");
