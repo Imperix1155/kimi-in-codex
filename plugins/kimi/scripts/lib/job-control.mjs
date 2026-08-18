@@ -12,7 +12,7 @@ import {
   TTL_SELF_ABORT_MESSAGE
 } from "./codex-jobs.mjs";
 import { getSessionRuntimeStatus } from "./kimi.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile, upsertJob, writeJobFile } from "./state.mjs";
+import { getConfig, listJobs, patchJobUnderLock, readJobFile, resolveJobFile, upsertJob } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -68,8 +68,17 @@ export function reconcileActiveJobs(workspaceRoot, options = {}) {
 }
 
 // Terminal writes go to BOTH the index and the durable record, so an
-// observer reading either sees the same truth.
-function markCodexJobTerminal(workspaceRoot, job, status, errorMessage) {
+// observer reading either sees the same truth — and both go out inside ONE
+// lock hold. The unlocked index-write-then-record-read-then-record-write it
+// replaces is the same read-then-write family as F1: the worker settles in
+// two writes, so a completion landing between the reconciler's own two
+// writes was relabelled `failed`/`unknown` and its result payload wiped.
+//
+// `abortIfSettled` is the RECONCILER's guard, not a blanket one. TTL
+// attribution (attributeTtlExpiry) exists precisely to relabel a record that
+// is already terminal — `cancelled`, or `failed` with the wedged-agent
+// message — so applying the guard there would turn it into a no-op.
+function markCodexJobTerminal(workspaceRoot, job, status, errorMessage, { abortIfSettled = false } = {}) {
   const completedAt = new Date().toISOString();
   const patch = {
     id: job.id,
@@ -79,11 +88,12 @@ function markCodexJobTerminal(workspaceRoot, job, status, errorMessage) {
     errorMessage,
     completedAt
   };
-  upsertJob(workspaceRoot, patch);
-  const stored = readStoredJob(workspaceRoot, job.id);
-  if (stored) {
-    writeJobFile(workspaceRoot, job.id, { ...stored, ...patch, id: job.id });
-  }
+  return patchJobUnderLock(workspaceRoot, job.id, ({ stored, indexed }) => {
+    if (abortIfSettled && settledCodexJobStatus(stored, indexed)) {
+      return null;
+    }
+    return patch;
+  }).applied;
 }
 
 // TTL self-abort attribution (§14 Q2): a worker whose own deadline timer
@@ -156,7 +166,8 @@ function reconcileCodexBackgroundJob(workspaceRoot, job, options, isAlive) {
       workspaceRoot,
       job,
       unresolvedStatus,
-      cancelRequested ? `${REBOOT_LIVENESS_MESSAGE} The cancellation was never confirmed.` : REBOOT_LIVENESS_MESSAGE
+      cancelRequested ? `${REBOOT_LIVENESS_MESSAGE} The cancellation was never confirmed.` : REBOOT_LIVENESS_MESSAGE,
+      { abortIfSettled: true }
     );
     return;
   }
@@ -166,7 +177,8 @@ function reconcileCodexBackgroundJob(workspaceRoot, job, options, isAlive) {
       workspaceRoot,
       job,
       unresolvedStatus,
-      cancelRequested ? `${DEADLINE_EXCEEDED_MESSAGE} The cancellation was never confirmed.` : DEADLINE_EXCEEDED_MESSAGE
+      cancelRequested ? `${DEADLINE_EXCEEDED_MESSAGE} The cancellation was never confirmed.` : DEADLINE_EXCEEDED_MESSAGE,
+      { abortIfSettled: true }
     );
     return;
   }
@@ -179,7 +191,8 @@ function reconcileCodexBackgroundJob(workspaceRoot, job, options, isAlive) {
       unresolvedStatus,
       cancelRequested
         ? `${LIVENESS_UNCONFIRMED_MESSAGE} The worker never recorded a cancelled stop reason, so the turn's fate is unknown.`
-        : LIVENESS_UNCONFIRMED_MESSAGE
+        : LIVENESS_UNCONFIRMED_MESSAGE,
+      { abortIfSettled: true }
     );
     return;
   }
@@ -193,7 +206,8 @@ function reconcileCodexBackgroundJob(workspaceRoot, job, options, isAlive) {
         workspaceRoot,
         job,
         "unknown",
-        "Cancellation was requested but never confirmed: no cancelled stop reason was recorded and the session could not be shown gone."
+        "Cancellation was requested but never confirmed: no cancelled stop reason was recorded and the session could not be shown gone.",
+        { abortIfSettled: true }
       );
     }
   }

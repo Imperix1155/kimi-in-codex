@@ -1978,6 +1978,116 @@ function listLeakedTestProcesses() {
   assert.equal(outcome.survivorRetained, true, "an ACTIVE job must never be pruned by MAX_JOBS");
 }
 
+// F1, the reconciler's own half of the two-source rule. The worker settles a
+// job in two writes — durable record first, index second — so in that gap the
+// index still reads `running` while the record already says `completed`. A
+// reconciler that decides from the index alone, then does an UNLOCKED
+// read-then-write of the durable file, relabels finished work `failed` or
+// `unknown` and can wipe the result payload written between its own two
+// writes. Every terminal write it makes must be one locked compare-and-write
+// that aborts when EITHER source is already terminal.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const probeScript = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      const jobControl = await import(process.argv[3]);
+      const codex = await import(process.argv[4]);
+      const workspaceRoot = process.argv[1];
+
+      // Every reconciler branch that writes a terminal state, exercised
+      // against a durable record that has ALREADY settled: reboot boundary,
+      // TTL expiry, dead worker, and the cancel-evidence window.
+      const settledBefore = {
+        status: "completed",
+        phase: "done",
+        pid: null,
+        completedAt: new Date().toISOString(),
+        result: { status: 0, stopReason: "end_turn", rawOutput: "SETTLED-UNDER-THE-RECONCILER" },
+        rendered: "SETTLED-UNDER-THE-RECONCILER\\n"
+      };
+      const cases = {
+        // bootId mismatch
+        reboot: { bootId: codex.currentBootId() - 86400000, ttlDeadline: new Date(Date.now() + 600000).toISOString() },
+        // deadline passed
+        ttl: { bootId: codex.currentBootId(), ttlDeadline: new Date(Date.now() - 1000).toISOString() },
+        // worker gone
+        dead: { bootId: codex.currentBootId(), ttlDeadline: new Date(Date.now() + 600000).toISOString(), pid: 999999 },
+        // cancel-requested past the evidence window
+        cancel: {
+          bootId: codex.currentBootId(),
+          ttlDeadline: new Date(Date.now() + 600000).toISOString(),
+          cancelRequestedAt: new Date(Date.now() - 600000).toISOString()
+        }
+      };
+
+      const outcome = {};
+      for (const [name, overrides] of Object.entries(cases)) {
+        const id = \`task-recon\${name}-aaaaaa\`;
+        const base = {
+          id,
+          codexBackground: true,
+          write: false,
+          workspaceRoot,
+          pid: null,
+          ...overrides
+        };
+        // Worker write 1 of 2: the durable record is terminal, with a result.
+        state.writeJobFile(workspaceRoot, id, { ...base, ...settledBefore });
+        // Worker write 2 of 2 has NOT landed: the index still reads active.
+        state.upsertJob(workspaceRoot, {
+          ...base,
+          status: name === "cancel" ? "cancel-requested" : "running",
+          phase: name === "cancel" ? "cancel-requested" : "running"
+        });
+
+        jobControl.reconcileActiveJobs(workspaceRoot, { isProcessAliveImpl: () => false });
+
+        const stored = state.readJobFile(state.resolveJobFile(workspaceRoot, id));
+        const indexed = state.listJobs(workspaceRoot).find((job) => job.id === id) ?? null;
+        outcome[name] = {
+          storedStatus: stored.status,
+          storedResult: stored.result?.rawOutput ?? null,
+          storedError: stored.errorMessage ?? null,
+          indexedStatus: indexed?.status ?? null
+        };
+      }
+      process.stdout.write(JSON.stringify(outcome));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      probeScript,
+      context.cwd,
+      pathToImport("../scripts/lib/state.mjs"),
+      pathToImport("../scripts/lib/job-control.mjs"),
+      pathToImport("../scripts/lib/codex-jobs.mjs")
+    ],
+    { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 20_000 }
+  );
+  assert.equal(probe.status, 0, `settled-reconciler probe failed: ${probe.stderr}`);
+  const settledOutcome = JSON.parse(probe.stdout);
+  for (const branch of ["reboot", "ttl", "dead", "cancel"]) {
+    const seen = settledOutcome[branch];
+    assert.equal(seen.storedStatus, "completed", `${branch}: a settled record must not be relabelled`);
+    assert.equal(
+      seen.storedResult,
+      "SETTLED-UNDER-THE-RECONCILER",
+      `${branch}: the user's recorded result must survive reconciliation`
+    );
+    assert.equal(seen.storedError, null, `${branch}: a completed job must not acquire a failure message`);
+    // The index may still be mid-gap (the worker's second write has not
+    // landed here), but it must never be left carrying a terminal CLAIM that
+    // contradicts the durable record.
+    assert.ok(
+      !["failed", "unknown", "cancelled"].includes(seen.indexedStatus),
+      `${branch}: the index must not be left claiming a terminal lie (${seen.indexedStatus})`
+    );
+  }
+}
+
 // F3: the MAX_JOBS active-exemption is for live detached CODEX workers only.
 // Applying it to legacy Claude records too resurrects a zombie: a legacy
 // `queued` entry that can never go terminal (an async spawn failure leaves
