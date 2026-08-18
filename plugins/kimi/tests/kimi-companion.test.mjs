@@ -1645,6 +1645,9 @@ function listLeakedTestProcesses() {
     [["--resume-last"], /--resume-last|resume/i],
     [["--resume"], /--resume-last|resume/i],
     [["--write", "edit something"], /write/i],
+    // F10: the refusal keys off the RAW --write flag. Reconciling it against
+    // --read-only first would turn this into a silent read-only launch.
+    [["--write", "--read-only", "edit something"], /write/i],
     // §14 Q2: TTL accepts 1-60; above the 60-minute hard ceiling is refused.
     [["--ttl-minutes", "61", "x"], /60/]
   ]) {
@@ -1775,6 +1778,65 @@ function listLeakedTestProcesses() {
     assert.match(worker.stderr, pattern, label);
     assert.equal(fs.existsSync(startMarker), false, `${label}: no turn may start after a refused authority check`);
   }
+  shutdownBroker(context.env, context.cwd);
+}
+
+// F8 + F9. Two contracts on the $kimi-job observation surface.
+//
+// F8: every refusal on this surface carries a JSON envelope. kimi-job/SKILL.md
+// tells the model to parse JSON, so exiting nonzero with empty stdout leaves
+// it with nothing to read — the defect class already hardened for --codex-once.
+//
+// F9: cancel is token-free by ratified contract, so a supplied --claim is
+// IGNORED, not validated. Validating it refused the one operation with no
+// off-switch on a typo, and made cancel a claim-token oracle: a caller who
+// never reads content could distinguish right token (proceeds) from wrong
+// token (errors).
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const launch = launchBackground(["job surface refusals"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const { jobId, claimToken } = launch.payload;
+  assert.ok(await pollCodexJobStatus(jobId, ["completed"], context), "seed job never completed");
+
+  // F8: refusals across all three verbs still speak JSON.
+  for (const args of [
+    ["status", "--codex-job", "task-nope", "--json"],
+    ["result", "--codex-job", "task-nope", "--claim", claimToken, "--json"],
+    ["cancel", "--codex-job", "task-nope", "--json"],
+    ["result", "--codex-job", jobId, "--json"]
+  ]) {
+    const refused = runCli(args, context);
+    assert.notEqual(refused.status, 0, `${args.join(" ")} must be refused`);
+    assert.ok(refused.stdout.trim(), `${args.join(" ")} must not refuse with empty stdout`);
+    const payload = JSON.parse(refused.stdout);
+    assert.equal(payload.jobStatus, "REFUSED", `${args.join(" ")} must emit the refusal envelope`);
+    assert.ok(payload.error, "the refusal envelope must carry the reason");
+  }
+
+  shutdownBroker(context.env, context.cwd);
+}
+
+// F9, against a LIVE job: a wrong claim token neither blocks the cancel nor
+// reveals that it was wrong.
+{
+  const context = makeBackgroundWorkspace("cancellable");
+  const launch = launchBackground(["a turn cancelled with the wrong token"], context);
+  assert.equal(launch.status, 0, launch.stderr);
+  const jobId = launch.payload.jobId;
+  assert.ok(await pollCodexJobStatus(jobId, ["running"], context, 15_000), "job never reached running");
+
+  const cancel = runCli(["cancel", "--codex-job", jobId, "--claim", "f".repeat(64), "--json"], context);
+  assert.equal(cancel.status, 0, `a wrong claim token must not block cancel: ${cancel.stderr}`);
+  const payload = JSON.parse(cancel.stdout);
+  assert.equal(payload.cancelStatus, "CANCELLED", `wrong token + cancel must still cancel: ${cancel.stdout}`);
+  assert.equal(payload.confirmed, true);
+  assert.equal(codexStatus(jobId, context).payload.job.status, "cancelled");
+  assert.doesNotMatch(
+    cancel.stdout + cancel.stderr,
+    /claim token/i,
+    "cancel must not answer whether a supplied token was right — that is the oracle"
+  );
   shutdownBroker(context.env, context.cwd);
 }
 
@@ -2084,6 +2146,109 @@ function listLeakedTestProcesses() {
     "an expired job must not report a cancellation nobody requested"
   );
   shutdownBroker(context.env, context.cwd);
+}
+
+// F12 canary. `errorMessage` is the one free-text field released in token-FREE
+// coarse metadata, so what can appear in it is a disclosure question. Every
+// terminal message the job-control library writes must come from the static
+// library set — no turn text, no tool output, no agent-supplied string.
+//
+// Scope, stated honestly: this pins the LIBRARY's terminal writers. It does
+// not pin runTrackedJob's catch, which records an arbitrary runtime
+// error.message by design (codex-jobs.mjs calls it out as runtime diagnostics
+// rather than agent content). This canary exists so that if a future change
+// ever routes turn text through a library terminal write, it turns red.
+{
+  const context = makeBackgroundWorkspace("slow-prompt");
+  const probeScript = `
+    (async () => {
+      const state = await import(process.argv[2]);
+      const jobControl = await import(process.argv[3]);
+      const codex = await import(process.argv[4]);
+      const workspaceRoot = process.argv[1];
+
+      const AGENT_TEXT = "PONG-SECRET-TURN-TEXT";
+      const seed = (extra) => {
+        const record = {
+          id: extra.id,
+          codexBackground: true,
+          write: false,
+          workspaceRoot,
+          pid: null,
+          // Content fields a leak would most plausibly be drawn from.
+          result: { rawOutput: AGENT_TEXT, stopReason: "end_turn" },
+          rendered: AGENT_TEXT,
+          request: { prompt: AGENT_TEXT },
+          threadId: "sess-secret-1",
+          ...extra
+        };
+        state.writeJobFile(workspaceRoot, record.id, record);
+        state.upsertJob(workspaceRoot, record);
+      };
+
+      const future = new Date(Date.now() + 600000).toISOString();
+      const past = new Date(Date.now() - 60000).toISOString();
+      // One record per terminal writer in the library.
+      seed({ id: "task-canary01-aaaaaa", status: "running", bootId: codex.currentBootId() - 86400000, ttlDeadline: future });
+      seed({ id: "task-canary02-bbbbbb", status: "running", bootId: codex.currentBootId(), ttlDeadline: past });
+      seed({ id: "task-canary03-cccccc", status: "running", bootId: codex.currentBootId(), ttlDeadline: future, pid: 999999 });
+      seed({ id: "task-canary04-dddddd", status: "cancel-requested", bootId: codex.currentBootId(), ttlDeadline: future, cancelRequestedAt: new Date(Date.now() - 60000).toISOString() });
+      seed({ id: "task-canary05-eeeeee", status: "cancel-requested", bootId: codex.currentBootId() - 86400000, ttlDeadline: future });
+      seed({ id: "task-canary06-ffffff", status: "cancel-requested", bootId: codex.currentBootId(), ttlDeadline: past });
+      // TTL self-abort attribution, the seventh writer.
+      seed({ id: "task-canary07-aabbcc", status: "cancelled", bootId: codex.currentBootId(), ttlDeadline: future });
+
+      jobControl.reconcileActiveJobs(workspaceRoot, { isProcessAliveImpl: () => false });
+      jobControl.attributeTtlExpiry(workspaceRoot, "task-canary07-aabbcc");
+
+      // Read back through the REAL coarse-metadata builder, token-free.
+      const messages = state.listJobs(workspaceRoot)
+        .filter((job) => job.id.startsWith("task-canary"))
+        .map((job) => codex.buildCodexJobMetadata(job).errorMessage);
+      process.stdout.write(JSON.stringify({ messages, agentText: AGENT_TEXT }));
+    })();
+  `;
+  const probe = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      probeScript,
+      context.cwd,
+      pathToImport("../scripts/lib/state.mjs"),
+      pathToImport("../scripts/lib/job-control.mjs"),
+      pathToImport("../scripts/lib/codex-jobs.mjs")
+    ],
+    { env: context.env, cwd: context.cwd, encoding: "utf8", timeout: 20_000 }
+  );
+  assert.equal(probe.status, 0, `errorMessage canary probe failed: ${probe.stderr}`);
+  const { messages, agentText } = JSON.parse(probe.stdout);
+  assert.equal(messages.length, 7, "every seeded record must reach a terminal library writer");
+
+  // The static library set. A message may only be one of these, optionally
+  // with the fixed cancellation suffix the reconciler appends.
+  const allowedStems = [
+    "Worker liveness cannot be confirmed; no result was recorded.",
+    "Worker liveness cannot be confirmed: the recorded worker did not survive a reboot boundary. No signal was sent to any process.",
+    "Deadline exceeded; worker liveness cannot be confirmed.",
+    "Deadline exceeded: the worker terminated the turn at its sealed TTL deadline. The job did not fail on its own; its time budget ran out.",
+    "Cancellation was requested but never confirmed: no cancelled stop reason was recorded and the session could not be shown gone."
+  ];
+  const allowedSuffixes = [
+    "",
+    " The cancellation was never confirmed.",
+    " The worker never recorded a cancelled stop reason, so the turn's fate is unknown."
+  ];
+  const allowed = new Set(allowedStems.flatMap((stem) => allowedSuffixes.map((suffix) => stem + suffix)));
+
+  for (const message of messages) {
+    assert.ok(message, "a terminal record must carry a message");
+    assert.ok(
+      allowed.has(message),
+      `coarse errorMessage must be a static library message, got: ${JSON.stringify(message)}`
+    );
+    assert.equal(message.includes(agentText), false, "agent turn text must never reach coarse metadata");
+    assert.doesNotMatch(message, /sess-secret/, "the ACP session id must never reach coarse metadata");
+  }
 }
 
 // §12 #12/#13 at the runtime level. Cancelling a job whose agent IGNORES

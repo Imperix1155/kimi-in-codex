@@ -1315,9 +1315,12 @@ async function handleTask(argv) {
     if (!options.json) {
       throw new Error("Codex background launches require --json.");
     }
-    const write = Boolean(options.write) && !options["read-only"];
+    // The RAW flag, deliberately not reconciled with --read-only. Background
+    // is sealed read-only either way, so reconciling first would let
+    // `--write --read-only` slip past as a silent read-only launch instead of
+    // the documented refusal naming `task --codex-once --write`.
     const workspaceRoot = resolveCommandWorkspace(options);
-    assertCodexBackgroundLaunchAllowed({ write, resumeLast, workspaceRoot });
+    assertCodexBackgroundLaunchAllowed({ write: Boolean(options.write), resumeLast, workspaceRoot });
     if (resumeSessionId && fresh) {
       throw new Error("Choose either --fresh or --resume-session.");
     }
@@ -1760,6 +1763,16 @@ function hasCodexBackgroundIntent(argv) {
   );
 }
 
+// The $kimi-job observation surface. Its skill tells the model to parse JSON,
+// so a refusal (malformed id, `result` on a running job) must not exit with
+// empty stdout — the same defect class already hardened for --codex-once.
+function hasCodexJobIntent(argv) {
+  if (!["status", "result", "cancel"].includes(argv[0])) {
+    return false;
+  }
+  return argv.some((arg) => arg === "--codex-job" || arg.startsWith("--codex-job="));
+}
+
 function hasCodexOneShotIntent(argv) {
   // Mirror parseArgs boolean semantics: --codex-once=false is NOT one-shot
   // intent, so failures on the legacy path never emit the one-shot envelope.
@@ -1793,6 +1806,12 @@ main().catch((error) => {
   }
   if (hasCodexBackgroundIntent(normalizedArgv) && jsonOutput) {
     console.log(JSON.stringify({ launchStatus: "REFUSED", error: message }, null, 2));
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  if (hasCodexJobIntent(normalizedArgv) && jsonOutput) {
+    console.log(JSON.stringify({ jobStatus: "REFUSED", error: message }, null, 2));
     process.stderr.write(`${message}\n`);
     process.exitCode = 1;
     return;
